@@ -1,0 +1,957 @@
+#!/usr/bin/env python3
+"""
+action_server.py — VLM-based Action Server for Articulated Object Manipulation
+
+Architecture
+------------
+  client_mujoco.py  <--ZMQ REQ-REP-->  action_server.py
+                                              |
+                                    det_pipeline (HTTP :8000)
+                                              |
+                                       VLM API (TODO)
+
+Wire protocol (ZMQ port 5555)
+-----------------------------
+Client → Server  compressed pickle of obs_dict:
+  'rgb'        : {'shape':(H,W,3),'dtype':'uint8',   'data':bytes}  — RGB from rgbd_camera
+  'depth'      : {'shape':(H,W),  'dtype':'float32', 'data':bytes}  — depth in metres
+  'cam_pos'    : {'shape':(3,),   'dtype':'float64', 'data':bytes}  — world pos of camera
+  'cam_mat'    : {'shape':(3,3),  'dtype':'float64', 'data':bytes}  — camera rotation matrix
+  'fovy'       : {'shape':(1,),   'dtype':'float64', 'data':bytes}  — vertical FoV (deg)
+  'agent_pos'  : {'shape':(1,T,10),'dtype':'float32','data':bytes}  — eef[3]+rot6d[6]+g[1]
+  'point_cloud': {'shape':(1,T,1280,3),'dtype':'float32','data':bytes}
+
+Server → Client  compressed pickle of action_dict:
+  {'shape':(10,), 'dtype':'float32', 'data':bytes}
+  layout: [target_pos(3), target_rot_6d(6), target_gripper(1)]
+"""
+
+import base64
+import json
+import pickle
+import traceback
+import zlib
+from typing import Any, Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import requests
+import zmq
+import matplotlib.pyplot as plt
+from scipy.spatial.transform import Rotation as R
+
+# ─────────────────────────── Configuration ────────────────────────────────────
+
+ZMQ_PORT         = 5555
+DET_SERVER_URL   = "http://127.0.0.1:8000/detect"
+DET_QUERIES      = ["handle", "drawer handle", "door handle", "drawer", "cabinet door"]
+DET_THRESHOLD    = 0.25
+
+USE_VISUALIZER   = True
+
+USER_INSTRUCTION = "open the bottom drawer"
+
+# Motion tuning
+APPROACH_DIST   = 0.20   # m — standoff before grasping
+STAGE_POS_TOL   = 0.032  # m — position tolerance to mark stage done
+STAGE_ANG_TOL   = 0.08   # rad
+STAGE_GRIP_TOL  = 0.004  # m gripper width
+GRASP_TIMEOUT_STEPS = 15 # steps (approx 1.5s) to wait for gripper
+
+MAX_DELTA_POS   = 0.018  # m per step (unused by server, handled by client)
+MAX_DELTA_ANG   = np.deg2rad(2.5)
+GRIPPER_DELTA   = 0.003  # m per step
+GRIPPER_OPEN    = 0.04
+GRIPPER_CLOSED  = 0.000
+GRASP_OFFSET    = 0.085  # m — distance from Panda 'hand' frame to finger tips
+TARGET_Z_OFFSET = 0.02   # m — upward shift of the target grasp point
+NORMAL_SCAN_RADIUS = 0.15 # m — radius around handle to sample panel points
+
+PULL_LINEAR_DIST = 0.38  # m total drawer pull
+PULL_STEP        = 0.005  # m per step increment
+PULL_ARC_ANGLE   = np.deg2rad(90)  # total door sweep
+ARC_STEP         = np.deg2rad(0.6)  # rad per step
+
+# ─────────────────────────── Rotation helpers ─────────────────────────────────
+
+def rot6d_to_matrix(r6d: np.ndarray) -> np.ndarray:
+    """6D rotation representation → 3×3 rotation matrix."""
+    r1 = r6d[:3];  r1 = r1 / (np.linalg.norm(r1) + 1e-8)
+    tmp = r6d[3:]
+    r2 = tmp - np.dot(tmp, r1) * r1;  r2 = r2 / (np.linalg.norm(r2) + 1e-8)
+    r3 = np.cross(r1, r2)
+    return np.stack([r1, r2, r3], axis=1)
+
+
+def matrix_to_rot6d(mat: np.ndarray) -> np.ndarray:
+    return np.concatenate([mat[:, 0], mat[:, 1]])
+
+
+def wxyz_to_scipy(wxyz: np.ndarray) -> R:
+    """MuJoCo w,x,y,z → scipy Rotation."""
+    return R.from_quat([wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
+
+
+def scipy_to_wxyz(rot: R) -> np.ndarray:
+    q = rot.as_quat()  # scipy: x,y,z,w
+    return np.array([q[3], q[0], q[1], q[2]])
+
+
+def look_at_rotation(forward: np.ndarray,
+                     up_hint: np.ndarray = np.array([0.0, 0.0, 1.0])) -> np.ndarray:
+    """Build a 3×3 rotation matrix whose Z-axis points along *forward*."""
+    z = forward / (np.linalg.norm(forward) + 1e-8)
+    right = np.cross(up_hint, z)
+    if np.linalg.norm(right) < 1e-6:
+        up_hint = np.array([0.0, 1.0, 0.0])
+        right = np.cross(up_hint, z)
+    x = right / (np.linalg.norm(right) + 1e-8)
+    y = np.cross(z, x)
+    return np.stack([x, y, z], axis=1)
+
+# ─────────────────────────── Deserialisation helper ───────────────────────────
+
+def deser(d: Dict) -> np.ndarray:
+    return np.frombuffer(d['data'], dtype=np.dtype(d['dtype'])).reshape(d['shape'])
+
+
+def decode_mask(b64_str: str, h: int, w: int) -> Optional[np.ndarray]:
+    """Decode base64 PNG mask to boolean array."""
+    try:
+        mask_bytes = base64.b64decode(b64_str)
+        mask_arr = np.frombuffer(mask_bytes, np.uint8)
+        mask_gray = cv2.imdecode(mask_arr, cv2.IMREAD_GRAYSCALE)
+        if mask_gray is None: return None
+        if mask_gray.shape != (h, w):
+            mask_gray = cv2.resize(mask_gray, (w, h), interpolation=cv2.INTER_NEAREST)
+        return mask_gray > 128
+    except Exception as e:
+        print(f"[Utils] Mask decode failed: {e}")
+        return None
+
+# ─────────────────────────── 3-D geometry ─────────────────────────────────────
+
+def backproject_pixel(u: float, v: float, depth_val: float,
+                      cam_pos: np.ndarray, cam_mat: np.ndarray,
+                      fovy_deg: float, h: int, w: int) -> np.ndarray:
+    """
+    Back-project image pixel (u, v) with given metric depth to world 3-D.
+
+    MuJoCo camera convention:
+      • camera looks along its local -Z axis
+      • Y is up in camera space
+    """
+    f = (h / 2.0) / np.tan(np.deg2rad(fovy_deg) / 2.0)
+    x_cam =  (u - w / 2.0) * depth_val / f
+    y_cam = -(v - h / 2.0) * depth_val / f   # image-Y down → camera-Y up
+    z_cam = -depth_val                         # depth along -Z
+    return cam_pos + cam_mat @ np.array([x_cam, y_cam, z_cam])
+
+
+def estimate_panel_normal(depth: np.ndarray, handle_bbox: List[int],
+                           handle_3d: np.ndarray,
+                           cam_pos: np.ndarray, cam_mat: np.ndarray,
+                           fovy_deg: float,
+                           parent_mask: Optional[np.ndarray] = None,
+                           scan_radius: float = NORMAL_SCAN_RADIUS) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estimate the outward face normal of the panel around the handle.
+    Uses a 3D radius search + 2D handle bbox exclusion + SAM mask filtering.
+    """
+    h, w = depth.shape
+    hx1, hy1, hx2, hy2 = [int(v) for v in handle_bbox]
+    
+    # 1. Determine 2D scan range. If we have a mask, use its bounds. 
+    # Otherwise fallback to a large window around handle.
+    if parent_mask is not None:
+        v_idx, u_idx = np.where(parent_mask)
+        if len(v_idx) == 0:
+            u1, v1, u2, v2 = max(0, hx1-100), max(0, hy1-100), min(w, hx2+100), min(h, hy2+100)
+        else:
+            u1, v1, u2, v2 = u_idx.min(), v_idx.min(), u_idx.max(), v_idx.max()
+    else:
+        u1, v1, u2, v2 = max(0, hx1-120), max(0, hy1-120), min(w, hx2+120), min(h, hy2+120)
+
+    f = (h / 2.0) / np.tan(np.deg2rad(fovy_deg) / 2.0)
+    
+    # Grid sampling (step 2 for speed)
+    vs, us = np.meshgrid(range(v1, v2, 2), range(u1, u2, 2), indexing='ij')
+    vs = vs.flatten();  us = us.flatten()
+    zs = depth[vs, us]
+    valid_depth = zs > 0
+    vs, us, zs = vs[valid_depth], us[valid_depth], zs[valid_depth]
+
+    final_pts = []
+    for i in range(len(zs)):
+        u, v, z = us[i], vs[i], zs[i]
+        
+        # A. Mask filter (if provided)
+        if parent_mask is not None and not parent_mask[v, u]:
+            continue
+            
+        # B. Handle exclusion filter (with 3px margin)
+        if (hx1 - 3 <= u <= hx2 + 3) and (hy1 - 3 <= v <= hy2 + 3):
+            continue
+            
+        # C. Back-project and check 3D radius
+        # (Internal back-projection for speed inside loop)
+        x_c = (u - w/2.0) * z / f
+        y_c = -(v - h/2.0) * z / f
+        p_world = cam_pos + cam_mat @ np.array([x_c, y_c, -z])
+        
+        if np.linalg.norm(p_world - handle_3d) < scan_radius:
+            final_pts.append(p_world)
+
+    if len(final_pts) < 10:
+        print(f"[Planner] [ERROR] normalize estimation failed: only {len(final_pts)} points found. Using fallback.")
+        return -cam_mat[:, 2], np.array(final_pts) if final_pts else np.zeros((0, 3))
+
+    pts_world = np.stack(final_pts)
+    ctr = pts_world.mean(axis=0)
+    _, _, Vt = np.linalg.svd(pts_world - ctr)
+    normal = Vt[-1]
+
+    # Force horizontal (z=0)
+    normal[2] = 0
+    normal = normal / (np.linalg.norm(normal) + 1e-8)
+
+    # Normal must point toward camera
+    if np.dot(normal, cam_pos - ctr) < 0:
+        normal = -normal
+    return normal, pts_world
+
+
+def estimate_hinge_params(depth: np.ndarray,
+                           parent_mask: np.ndarray,
+                           handle_bbox: List[int],
+                           cam_pos: np.ndarray, cam_mat: np.ndarray,
+                           fovy_deg: float) -> Tuple[np.ndarray, float, np.ndarray]:
+    """
+    Estimate hinge world position by looking at the extreme horizontal 
+    edge of the door mask opposite to the handle.
+    """
+    h, w = depth.shape
+    v_idx, u_idx = np.where(parent_mask)
+    if len(v_idx) == 0:
+        return np.array([0, 0, 0]), 0.3
+
+    u_min, u_max = u_idx.min(), u_idx.max()
+    hx1, hy1, hx2, hy2 = handle_bbox
+    hu = (hx1 + hx2) / 2.0
+    
+    # Identify hinge side: opposite to handle
+    mask_width = u_max - u_min
+    if hu > (u_min + u_max) / 2.0:
+        # Handle is on the right -> hinge is Left
+        edge_u = u_min
+        edge_pixels = (parent_mask[:, u_min : u_min + max(1, int(mask_width * 0.01))])
+        edge_v_local, edge_u_local = np.where(edge_pixels)
+        target_u = edge_u_local + u_min
+        target_v = edge_v_local
+    else:
+        # Handle is on the left -> hinge is Right
+        edge_u = u_max
+        edge_pixels = (parent_mask[:, u_max - max(1, int(mask_width * 0.05)) : u_max + 1])
+        edge_v_local, edge_u_local = np.where(edge_pixels)
+        target_u = edge_u_local + (u_max - max(1, int(mask_width * 0.05)))
+        target_v = edge_v_local
+
+    if len(target_u) == 0:
+        return np.array([0,0,0]), 0.3
+
+    f = (h / 2.0) / np.tan(np.deg2rad(fovy_deg) / 2.0)
+    
+    # Sample subset for speed
+    step = max(1, len(target_u) // 200)
+    target_u, target_v = target_u[::step], target_v[::step]
+    
+    edge_pts_3d = []
+    for u, v in zip(target_u, target_v):
+        z = depth[v, u]
+        if z <= 0: continue
+        x_c = (u - w/2.0) * z / f
+        y_c = -(v - h/2.0) * z / f
+        p_world = cam_pos + cam_mat @ np.array([x_c, y_c, -z])
+        edge_pts_3d.append(p_world)
+
+    if len(edge_pts_3d) < 5:
+        return np.array([0,0,0]), 0.3
+
+    pts = np.stack(edge_pts_3d)
+    
+    # Outlier removal: filter by Z-height consistency
+    z_med = np.median(pts[:, 2])
+    z_std = np.std(pts[:, 2])
+    valid_mask = np.abs(pts[:, 2] - z_med) < max(0.1, z_std * 2.0)
+    pts = pts[valid_mask]
+    
+    if len(pts) == 0:
+        return np.array([0,0,0]), 0.3
+
+    # The hinge axis is the average XY of the edge points
+    hinge_xy = pts[:, :2].mean(axis=0)
+    hinge_pos = np.array([hinge_xy[0], hinge_xy[1], z_med])
+    
+    # Sample handle 3D again to ensure radius is consistent
+    h_uc, h_vc = (hx1 + hx2) / 2.0, (hy1 + hy2) / 2.0
+    h_z = depth[int(h_vc), int(h_uc)]
+    if h_z <= 0: # handle center might be a hole, sample nearby
+        h_z = z_med 
+    h_xc = (h_uc - w/2.0) * h_z / f
+    h_yc = -(h_vc - h/2.0) * h_z / f
+    handle_3d_proj = cam_pos + cam_mat @ np.array([h_xc, h_yc, -h_z])
+    
+    radius = np.linalg.norm(handle_3d_proj[:2] - hinge_xy)
+    print(f"[Planner] Hinge optimized: Side={'Left' if hu > (u_min+u_max)/2.0 else 'Right'}, Pos={np.round(hinge_pos, 3)}, Radius={radius:.3f}m")
+    
+    return hinge_pos, radius, pts
+
+# ─────────────────────────── Detection & annotation ───────────────────────────
+
+def call_detection(rgb_bgr: np.ndarray) -> List[Dict[str, Any]]:
+    """POST to det_pipeline FastAPI server and return detection list."""
+    _, buf = cv2.imencode('.jpg', rgb_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    try:
+        resp = requests.post(
+            DET_SERVER_URL,
+            files={"file": ("obs.jpg", buf.tobytes(), "image/jpeg")},
+            data={"text_queries": json.dumps(DET_QUERIES),
+                  "score_threshold": DET_THRESHOLD},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("detections", [])
+    except Exception as e:
+        print(f"[Det] Detection call failed: {e}")
+        return []
+
+
+def draw_annotated_image(rgb_bgr: np.ndarray,
+                          detections: List[Dict]) -> np.ndarray:
+    """Overlay bbox + numeric ID labels for the VLM."""
+    out = rgb_bgr.copy()
+    for det in detections:
+        idx     = det.get("index", "?")
+        x1, y1, x2, y2 = det["box"]
+        label   = det["detection"][0]["label"]
+        score   = det["detection"][0]["score"]
+        text    = f"[{idx}] {label} {score:.2f}"
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 220, 0), 2)
+        cv2.rectangle(out, (x1, y1 - th - 5), (x1 + tw + 3, y1), (0, 220, 0), -1)
+        cv2.putText(out, text, (x1 + 1, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+    return out
+
+# ─────────────────────────── Visualization ────────────────────────────────────
+
+class Visualizer3D:
+    def __init__(self, window_name="Action Server Visualizer"):
+        plt.ion()
+        self.fig = plt.figure(window_name, figsize=(8, 8))
+        self.ax = self.fig.add_subplot(111, projection='3d')
+        
+        # Initial view
+        self.ax.view_init(elev=25, azim=-135)
+        self.ax.set_xlabel('X'); self.ax.set_ylabel('Y'); self.ax.set_zlabel('Z')
+        
+        # Fixed limits for stability
+        self.ax.set_xlim(0.5, 1.5)
+        self.ax.set_ylim(-0.5, 0.5)
+        self.ax.set_zlim(0.0, 1.2)
+        
+        # KEY FIX: Force equal aspect ratio so axes don't look skewed/slanted
+        self.ax.set_box_aspect((1, 1, 1)) 
+
+        # Plot components
+        self.points_scat = self.ax.scatter([], [], [], s=2, c='gray', alpha=0.3, label='Background PCD')
+        self.normal_scat = self.ax.scatter([], [], [], s=10, c='red', alpha=0.8, label='Normal Sample Pts')
+        self.hinge_pts_scat = self.ax.scatter([], [], [], s=15, c='blue', alpha=0.9, label='Hinge Edge Pts')
+        self.hinge_scat  = self.ax.scatter([], [], [], s=150, c='magenta', edgecolors='black', alpha=1.0, label='Hinge Axis', marker='*')
+        self.hinge_line, = self.ax.plot([], [], [], color='magenta', linewidth=3, alpha=0.8, label='Hinge Line')
+        self.curr_quivers = None
+        self.tgt_quivers  = None
+
+    def update(self, points=None, normal_pts=None, hinge_pos=None,
+               hinge_pts=None, curr_pos=None, curr_mat=None, 
+               tgt_pos=None, tgt_mat=None):
+        updated = False
+        
+        if points is not None and len(points) > 0:
+            # Update point cloud
+            self.points_scat._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
+            # Color by height
+            z = points[:, 2]
+            z_norm = (z - z.min()) / (z.max() - z.min() + 1e-6)
+            self.points_scat.set_array(z_norm)
+            updated = True
+
+        if normal_pts is not None and len(normal_pts) > 0:
+            self.normal_scat._offsets3d = (normal_pts[:, 0], normal_pts[:, 1], normal_pts[:, 2])
+            updated = True
+
+        if hinge_pts is not None and len(hinge_pts) > 0:
+            self.hinge_pts_scat._offsets3d = (hinge_pts[:, 0], hinge_pts[:, 1], hinge_pts[:, 2])
+            updated = True
+
+        if hinge_pos is not None:
+            self.hinge_scat._offsets3d = (np.array([hinge_pos[0]]), np.array([hinge_pos[1]]), np.array([hinge_pos[2]]))
+            # Draw a vertical line from floor to ceiling
+            self.hinge_line.set_data_3d([hinge_pos[0], hinge_pos[0]], 
+                                        [hinge_pos[1], hinge_pos[1]], 
+                                        [0.0, 1.2])
+            updated = True
+
+        if curr_pos is not None and curr_mat is not None:
+            if self.curr_quivers:
+                for q in self.curr_quivers: q.remove()
+            self.curr_quivers = self._draw_axes(curr_pos, curr_mat, scale=0.15, alpha=1.0)
+            updated = True
+
+        if tgt_pos is not None and tgt_mat is not None:
+            if self.tgt_quivers:
+                for q in self.tgt_quivers: q.remove()
+            self.tgt_quivers = self._draw_axes(tgt_pos, tgt_mat, scale=0.1, alpha=0.4)
+            updated = True
+
+        if updated:
+            self.fig.canvas.draw_idle()
+        
+        # Standard matplotlib event processing
+        plt.pause(0.01)
+
+    def _draw_axes(self, pos, mat, scale=0.1, alpha=1.0):
+        """Draw RGB vectors for orientation."""
+        qs = []
+        colors = ['r', 'g', 'b'] # X, Y, Z
+        for i in range(3):
+            q = self.ax.quiver(pos[0], pos[1], pos[2], 
+                               mat[0, i], mat[1, i], mat[2, i],
+                               length=scale, color=colors[i], alpha=alpha, 
+                               linewidth=2, normalize=True)
+            qs.append(q)
+        return qs
+
+# ─────────────────────────── VLM API (TODO stub) ──────────────────────────────
+
+VLM_SYSTEM_PROMPT = """\
+**Role**: You are a high-level Robotic Task Planner for articulated object manipulation.
+
+**Task**:
+Analyze the input image containing ID-labeled bounding boxes. Based on the user's natural
+language instruction, generate a structured JSON plan to operate drawers or cabinet doors.
+
+**Object Categories & Logic**:
+1. **Drawer**: A sliding object.
+   - `motion_type`: `Translation`
+   - `valid_action`: `Pull_Linear`
+2. **Cabinet Door**: A hinged swinging object.
+   - `motion_type`: `Rotation`
+   - `valid_action`: `Pull_Arc`
+
+**Gripper Orientation Logic**:
+- `Horizontal`: Select if the handle's width is significantly greater than its height.
+- `Vertical`: Select if the handle's height >= width, or if it is a knob/square shape.
+
+**Strict Constraints**:
+1. **Valid Stages**: ONLY use these: ["MoveTo", "Grasp", "Pull_Linear", "Pull_Arc", "Release"]
+2. **Output Format**: Return ONLY a valid JSON object. No preamble, no post-analysis.
+
+**JSON Schema**:
+{
+  "target_handle_id": int,
+  "parent_object_id": int,
+  "motion_type": "Translation" | "Rotation",
+  "gripper_orientation": "Horizontal" | "Vertical",
+  "plan": ["Stage_1", "Stage_2", ...]
+}
+
+---
+**User Instruction**: """
+
+
+def call_vlm(annotated_bgr: np.ndarray, user_instruction: str,
+             detections: List[Dict]) -> Dict[str, Any]:
+    """
+    Call the VLM API with the annotated image and user instruction.
+
+    TODO: Replace the stub below with a real API call, e.g.:
+
+        import base64, openai
+        _, buf = cv2.imencode('.jpg', annotated_bgr)
+        img_b64 = base64.b64encode(buf.tobytes()).decode()
+        client = openai.OpenAI(api_key=..., base_url=...)
+        resp = client.chat.completions.create(
+            model="qwen-vl-plus",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    {"type": "text",
+                     "text": VLM_SYSTEM_PROMPT + user_instruction},
+                ]
+            }]
+        )
+        return json.loads(resp.choices[0].message.content)
+    """
+    print("[VLM] TODO: VLM API not wired up yet — using heuristic default plan.")
+
+    # Heuristic default: pick the first handle, first drawer/door
+    handle_id = next(
+        (d["index"] for d in detections
+         if "handle" in d["detection"][0]["label"].lower()), 0)
+    parent_id = next(
+        (d["index"] for d in detections
+         if any(kw in d["detection"][0]["label"].lower()
+                for kw in ("drawer", "door", "cabinet"))), 1)
+
+    # return {
+    #     "target_handle_id": 6,
+    #     "parent_object_id": 7,
+    #     "motion_type": "Translation",
+    #     "gripper_orientation": "Vertical",
+    #     "plan": ["MoveTo", "Approach", "Grasp", "Pull_Linear", "Release"],
+    # }
+    return {
+        "target_handle_id": 3,
+        "parent_object_id": 2,
+        "motion_type": "Rotation",
+        "gripper_orientation": "Horizontal",
+        "plan": ["MoveTo", "Approach", "Grasp", "Pull_Arc", "Release"],
+    }
+
+# ─────────────────────────── Action Planner ───────────────────────────────────
+
+class ActionPlanner:
+    """
+    Stateful planner that:
+      1. On first step: runs detection → VLM → builds geometric targets.
+      2. Every step: drives gripper toward the current stage target, advances
+         stage when tolerance is met.
+
+    Stage targets
+    -------------
+    MoveTo       : pre-grasp position (handle + panel_normal * APPROACH_DIST)
+                   gripper open
+    Grasp        : handle 3-D position, gripper closing to GRIPPER_CLOSED
+    Pull_Linear  : incremental target advancing along panel_normal by PULL_STEP
+                   per step until PULL_LINEAR_DIST is reached; gripper closed
+    Pull_Arc     : incremental arc around estimated hinge; gripper closed
+    Release      : stay in place, gripper opens
+    """
+
+    def __init__(self, user_instruction: str = USER_INSTRUCTION, 
+                 use_visualizer: bool = USE_VISUALIZER):
+        self.user_instruction = user_instruction
+        self.use_visualizer = use_visualizer
+        self.visualizer = Visualizer3D() if use_visualizer else None
+        self._reset()
+
+    # ── public ──────────────────────────────────────────────────────────────
+
+    def reset(self):
+        self._reset()
+
+    def process(self, obs: Dict) -> np.ndarray:
+        """
+        Consume one observation dict, return action (10,) float32:
+        [delta_pos(3), delta_rot_6d(6), gripper_cmd(1)]
+        """
+        rgb_arr  = deser(obs['rgb'])          # (H,W,3)
+        depth    = deser(obs['depth'])        # (H,W) metres
+        cam_pos  = deser(obs['cam_pos'])      # (3,)
+        cam_mat  = deser(obs['cam_mat'])      # (3,3)
+        fovy     = float(deser(obs['fovy'])[0])
+        ap       = deser(obs['agent_pos'])    # (1,T,10)
+        pc       = deser(obs['point_cloud'])  # (1,T,N,3)
+        
+        # print(f"[Server] Recv obs: RGB={rgb_arr.shape}, PC={pc.shape}, AP={ap.shape}")
+
+        agent_last  = ap[0, -1, :]            # (10,)
+        curr_pos    = agent_last[:3].copy()
+        curr_rot    = rot6d_to_matrix(agent_last[3:9])
+        curr_grip   = float(agent_last[9])
+        pcloud_last = pc[0, -1, :, :]         # (1280,3)
+
+        rgb_bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
+
+        if self.state == "INIT":
+            print("[Planner] Entering INIT state, calling backend services...")
+            self._initialize(rgb_bgr, depth, cam_pos, cam_mat, fovy,
+                             curr_pos, pcloud_last)
+            print(f"[Planner] INIT done. State: {self.state}")
+
+        if self.state in ("ERROR", "DONE"):
+            # Return current pose as target to stop: [curr_pos, curr_rot6d, curr_grip]
+            return np.concatenate([curr_pos, matrix_to_rot6d(curr_rot), [curr_grip]]).astype(np.float32)
+
+        action = self._step(curr_pos, curr_rot, curr_grip)
+        
+        # Update visualization
+        if self.visualizer:
+            # We need target pos/mat for visualization. 
+            # Note: self._step actually computes these internally. 
+            # Let's peek at them if we stored them, or just rely on _step's side effects
+            # Actually, I'll pass the latest target info to visualizer in _step or here.
+            self.visualizer.update(points=pcloud_last, normal_pts=self.normal_pts,
+                                   hinge_pos=self.arc_hinge, hinge_pts=self.hinge_edge_pts,
+                                   curr_pos=curr_pos, curr_mat=curr_rot)
+            
+        return action
+
+    # ── private: initialisation ─────────────────────────────────────────────
+
+    def _reset(self):
+        self.state      : str            = "INIT"
+        self.plan_data  : Optional[Dict] = None
+        self.stages     : List[str]      = []
+        self.stage_idx  : int            = 0
+        self.stage_step_count : int      = 0
+        self.detections : List[Dict]     = []
+
+        self.handle_3d    : Optional[np.ndarray] = None
+        self.grasp_target_pos : Optional[np.ndarray] = None # 'hand' pose to reach handle
+        self.grasp_pos    : Optional[np.ndarray] = None
+        self.grasp_quat   : Optional[np.ndarray] = None
+        self.post_pull_pos: Optional[np.ndarray] = None
+        self.approach_pos : Optional[np.ndarray] = None
+        self.approach_quat: Optional[np.ndarray] = None  # wxyz
+        self.panel_normal : Optional[np.ndarray] = None
+        self.normal_pts   : Optional[np.ndarray] = None
+        self.hinge_edge_pts : np.ndarray         = np.zeros((0, 3))
+
+        # Pull_Linear state
+        self.pull_target : Optional[np.ndarray] = None
+
+        # Pull_Arc state
+        self.arc_hinge        : Optional[np.ndarray] = None
+        self.arc_radius       : float = 0.3
+        self.arc_current_angle: float = 0.0
+        self.arc_target_angle : float = 0.0
+        self.arc_start_angle  : float = 0.0
+        self.arc_direction    : float = 1.0  # +1 for ccw, -1 for cw
+        self.arc_initialized  : bool  = False
+
+    def _initialize(self, rgb_bgr, depth, cam_pos, cam_mat, fovy,
+                    curr_pos, point_cloud):
+        H, W = depth.shape
+
+        # ── 1. Detection ───────────────────────────────────────────────────
+        print("[Planner] [Step 1/7] Running detection...")
+        self.detections = call_detection(rgb_bgr)
+        print(f"[Planner] [Step 1/7] {len(self.detections)} objects detected.")
+
+        if not self.detections:
+            print("[Planner] [Step 1/7] No detections — entering ERROR state.")
+            self.state = "ERROR"
+            return
+
+        annotated = draw_annotated_image(rgb_bgr, self.detections)
+        cv2.imwrite("action_server_annotated.jpg", annotated)
+        print("[Planner] [Step 2/7] Annotated image saved.")
+
+        # ── 2. VLM ────────────────────────────────────────────────────────
+        print("[Planner] [Step 3/7] Calling VLM reasoning...")
+        plan = call_vlm(annotated, self.user_instruction, self.detections)
+        print(f"[Planner] [Step 3/7] VLM Plan resolved: {plan.get('target_handle_id')}")
+        self.plan_data = plan
+        self.stages    = plan["plan"]
+
+        # ── 3. Resolve handle and parent detections ────────────────────────
+        print("[Planner] [Step 4/7] Resolving 3D positions...")
+        handle_det = next(
+            (d for d in self.detections if d["index"] == plan["target_handle_id"]),
+            self.detections[0],
+        )
+
+        # ── 4. Handle 3-D position via depth back-projection ───────────────
+        bx1, by1, bx2, by2 = handle_det["box"]
+        uc, vc = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+        d_val = self._sample_valid_depth(depth, vc, uc, H, W)
+
+        if d_val > 0:
+            self.handle_3d = backproject_pixel(uc, vc, d_val, cam_pos, cam_mat, fovy, H, W)
+        else:
+            self.handle_3d = point_cloud.mean(axis=0)
+        
+        # Apply upward offset
+        self.handle_3d[2] += TARGET_Z_OFFSET
+        
+        print(f"[Planner] [Step 4/7] handle_3d resolved: {np.round(self.handle_3d, 3)} (with +{TARGET_Z_OFFSET}m Z-offset)")
+
+        # ── 5. Panel normal ────────────────────────────────────────────────
+        print("[Planner] [Step 5/7] Estimating panel normal...")
+        # Resolve parent object mask for precise filtering
+        parent_det = next((d for d in self.detections if d["index"] == plan.get("parent_object_id")), None)
+        parent_mask = decode_mask(parent_det["mask"], H, W) if (parent_det and "mask" in parent_det) else None
+        
+        self.panel_normal, self.normal_pts = estimate_panel_normal(
+            depth, handle_det["box"], self.handle_3d, 
+            cam_pos, cam_mat, fovy, 
+            parent_mask=parent_mask
+        )
+        print(f"[Planner] Final normal = {np.round(self.panel_normal, 3)}")
+        
+        # ── 6. Approach orientation ────────────────────────────────────────
+        print("[Planner] [Step 6/7] Planning approach trajectories...")
+        approach_dir = -self.panel_normal
+        up_hint = (np.array([1.0, 0.0, 0.0]) if plan.get("gripper_orientation") == "Horizontal" else np.array([0.0, 0.0, 1.0]))
+        approach_rot = look_at_rotation(approach_dir, up_hint)
+        self.approach_quat = scipy_to_wxyz(R.from_matrix(approach_rot))
+        self.grasp_target_pos = self.handle_3d - GRASP_OFFSET * approach_dir
+        self.approach_pos = self.grasp_target_pos + self.panel_normal * APPROACH_DIST
+
+        # ── 7. Arc parameters (hinged door only) ──────────────────────────
+        if plan["motion_type"] == "Rotation":
+            print("[Planner] [Step 7/7] Estimating hinge for Rotation...")
+            if parent_mask is not None:
+                self.arc_hinge, self.arc_radius, self.hinge_edge_pts = estimate_hinge_params(
+                    depth, parent_mask, handle_det["box"],
+                    cam_pos, cam_mat, fovy
+                )
+            else:
+                print("[Planner] [WARN] No parent mask for hinge estimation!")
+                self.arc_hinge, self.arc_radius = np.array([0,0,0]), 0.3
+
+        print("[Planner] All INIT steps finished successfully.")
+        self.state     = "EXECUTING"
+        self.stage_idx = 0
+
+    @staticmethod
+    def _sample_valid_depth(depth, vc, uc, H, W, radius=3):
+        """Return first non-zero depth near pixel (uc, vc)."""
+        for dv, du in [(0,0),(0,2),(0,-2),(2,0),(-2,0),(2,2),(-2,-2)]:
+            vv = int(vc + dv);  uu = int(uc + du)
+            if 0 <= vv < H and 0 <= uu < W:
+                d = float(depth[vv, uu])
+                if d > 0:
+                    return d
+        return 0.0
+
+    # ── private: per-step execution ────────────────────────────────────────
+
+    def _step(self, curr_pos, curr_rot, curr_grip) -> np.ndarray:
+        if self.stage_idx >= len(self.stages):
+            self.state = "DONE"
+            print("[Planner] All stages complete.")
+            # Return current pose as target to stop
+            d_rot_6d = matrix_to_rot6d(curr_rot)
+            return np.concatenate([curr_pos, d_rot_6d, [curr_grip]]).astype(np.float32)
+
+        stage = self.stages[self.stage_idx]
+        self.stage_step_count += 1
+        tgt_pos, tgt_quat, tgt_grip = self._target(stage, curr_pos, curr_rot, curr_grip)
+
+        # ── completion check ─────────────────────────────────────────
+        pos_err  = np.linalg.norm(tgt_pos - curr_pos)
+        tgt_rot   = wxyz_to_scipy(tgt_quat)
+        cur_rot_s = R.from_matrix(curr_rot)
+        ang_err  = np.linalg.norm((tgt_rot * cur_rot_s.inv()).as_rotvec())
+        grip_err = abs(tgt_grip - curr_grip)
+
+        if self._is_stage_done(stage, pos_err, ang_err, grip_err, curr_pos):
+            print(f"[Planner] Stage '{stage}' done "
+                  f"(pos_err={pos_err:.4f}m, grip_err={grip_err:.4f})")
+            self._on_complete(stage, curr_pos, curr_rot)
+            self.stage_idx += 1
+            if self.stage_idx < len(self.stages):
+                print(f"[Planner] → '{self.stages[self.stage_idx]}'")
+
+        # Update visualization with target pose
+        if self.visualizer:
+            self.visualizer.update(tgt_pos=tgt_pos, tgt_mat=tgt_rot.as_matrix())
+
+        return np.concatenate([tgt_pos, matrix_to_rot6d(tgt_rot.as_matrix()), [tgt_grip]]).astype(np.float32)
+
+    # ── stage target computation ───────────────────────────────────────────
+
+    def _target(self, stage: str, curr_pos, curr_rot,
+                curr_grip) -> Tuple[np.ndarray, np.ndarray, float]:
+        """Return (target_pos, target_quat_wxyz, target_gripper_width)."""
+
+        # ── MoveTo ────────────────────────────────────────────────────────
+        if stage == "MoveTo":
+            return self.approach_pos, self.approach_quat, GRIPPER_OPEN
+
+        # ── Approach [NEW] ────────────────────────────────────────────────
+        if stage == "Approach":
+            return self.grasp_target_pos, self.approach_quat, GRIPPER_OPEN
+
+        # ── Grasp ─────────────────────────────────────────────────────────
+        elif stage == "Grasp":
+            return self.grasp_target_pos, self.approach_quat, GRIPPER_CLOSED
+
+        # ── Pull_Linear ───────────────────────────────────────────────────
+        elif stage == "Pull_Linear":
+            start = self.grasp_pos if self.grasp_pos is not None else curr_pos
+            final = start + self.panel_normal * PULL_LINEAR_DIST
+
+            # Initialise or advance incremental target
+            if self.pull_target is None:
+                self.pull_target = start.copy()
+            remaining = final - self.pull_target
+            d = np.linalg.norm(remaining)
+            if d > PULL_STEP:
+                self.pull_target = self.pull_target + remaining / d * PULL_STEP
+            else:
+                self.pull_target = final.copy()
+
+            return (self.pull_target,
+                    self.grasp_quat if self.grasp_quat is not None else self.approach_quat,
+                    GRIPPER_CLOSED)
+
+        # ── Pull_Arc ──────────────────────────────────────────────────────
+        elif stage == "Pull_Arc":
+            if not self.arc_initialized:
+                start = self.grasp_pos if self.grasp_pos is not None else curr_pos
+                diff  = start[:2] - self.arc_hinge[:2]
+                self.arc_current_angle = np.arctan2(diff[1], diff[0])
+                self.arc_start_angle = self.arc_current_angle
+                
+                # Adaptive direction logic:
+                # We want a rotation direction that moves the handle in the 
+                # direction of the panel_normal (outward).
+                # tangent = z_axis x (handle - hinge)
+                # sign = sign(tangent · panel_normal)
+                radius_vec = start[:2] - self.arc_hinge[:2]
+                tangent_ccw = np.array([-radius_vec[1], radius_vec[0]])
+                dot = np.dot(tangent_ccw, self.panel_normal[:2])
+                
+                self.arc_direction = 1.0 if dot > 0 else -1.0
+                self.arc_target_angle  = self.arc_current_angle + self.arc_direction * PULL_ARC_ANGLE
+                self.arc_initialized   = True
+                
+                print(f"[Planner] Arc init: StartAngle={self.arc_current_angle:.2f}, "
+                      f"Dir={self.arc_direction}, Target={self.arc_target_angle:.2f}")
+
+            # Advance arc angle
+            remaining_angle = self.arc_target_angle - self.arc_current_angle
+            if abs(remaining_angle) > ARC_STEP:
+                self.arc_current_angle += np.sign(remaining_angle) * ARC_STEP
+            else:
+                self.arc_current_angle = self.arc_target_angle
+
+            handle_z = (self.grasp_pos[2] if self.grasp_pos is not None
+                        else curr_pos[2])
+            arc_pos = np.array([
+                self.arc_hinge[0] + self.arc_radius * np.cos(self.arc_current_angle),
+                self.arc_hinge[1] + self.arc_radius * np.sin(self.arc_current_angle),
+                handle_z,
+            ])
+
+            # Smoothly rotate gripper orientation:
+            # delta_theta = current - start. Apply rotation around Z-axis to initial grasp orientation.
+            delta_theta = self.arc_current_angle - self.arc_start_angle
+            
+            # Initial orientation at grasp
+            r_grasp = wxyz_to_scipy(self.grasp_quat)
+            # Offset rotation around global Z
+            r_offset = R.from_rotvec([0, 0, delta_theta])
+            arc_quat = scipy_to_wxyz(r_offset * r_grasp)
+            
+            return arc_pos, arc_quat, GRIPPER_CLOSED
+
+        # ── Release ───────────────────────────────────────────────────────
+        elif stage == "Release":
+            stay = (self.post_pull_pos if self.post_pull_pos is not None
+                    else curr_pos).copy()
+            q = (self.grasp_quat if self.grasp_quat is not None
+                 else self.approach_quat)
+            return stay, q, GRIPPER_OPEN
+
+        else:
+            print(f"[Planner] Unknown stage '{stage}' — holding position.")
+            return (curr_pos.copy(),
+                    scipy_to_wxyz(R.from_matrix(curr_rot)),
+                    curr_grip)
+
+    def _is_stage_done(self, stage: str,
+                        pos_err: float, ang_err: float, grip_err: float,
+                        curr_pos: np.ndarray) -> bool:
+        if stage in ("MoveTo", "Approach"):
+            return (pos_err < STAGE_POS_TOL) and (ang_err < STAGE_ANG_TOL)
+
+        elif stage == "Grasp":
+            # Done when closed OR timeout (due to object collision)
+            return (grip_err < STAGE_GRIP_TOL) or (self.stage_step_count > GRASP_TIMEOUT_STEPS)
+
+        elif stage == "Pull_Linear":
+            if self.grasp_pos is None:
+                return False
+            pulled = np.linalg.norm(curr_pos - self.grasp_pos)
+            return pulled >= PULL_LINEAR_DIST - STAGE_POS_TOL
+
+        elif stage == "Pull_Arc":
+            return abs(self.arc_target_angle - self.arc_current_angle) < np.deg2rad(1.5)
+
+        elif stage == "Release":
+            return (grip_err < STAGE_GRIP_TOL) or (self.stage_step_count > GRASP_TIMEOUT_STEPS)
+
+        return False
+
+    def _on_complete(self, stage: str, curr_pos: np.ndarray, curr_rot: np.ndarray):
+        """Save state that later stages depend on."""
+        self.stage_step_count = 0
+        
+        if stage == "Grasp":
+            self.grasp_pos  = curr_pos.copy()
+            self.grasp_quat = scipy_to_wxyz(R.from_matrix(curr_rot))
+            print(f"[Planner] Grasp recorded at {np.round(self.grasp_pos, 3)}")
+        elif stage in ("Pull_Linear", "Pull_Arc"):
+            self.post_pull_pos = curr_pos.copy()
+            self.pull_target = None   # reset for potential reuse
+
+# ─────────────────────────── ZMQ server main loop ─────────────────────────────
+
+def main():
+    context = zmq.Context()
+    socket  = context.socket(zmq.REP)
+    socket.bind(f"tcp://*:{ZMQ_PORT}")
+    print(f"[Server] VLM Action Server listening on tcp://*:{ZMQ_PORT}")
+    print(f"[Server] Detection endpoint: {DET_SERVER_URL}")
+    print(f"[Server] User instruction: '{USER_INSTRUCTION}'")
+
+    planner = ActionPlanner(user_instruction=USER_INSTRUCTION)
+
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+
+    while True:
+        # Poll with timeout to keep visualizer responsive
+        socks = dict(poller.poll(timeout=10))
+        if socket in socks and socks[socket] == zmq.POLLIN:
+            raw = socket.recv()
+            try:
+                obs = pickle.loads(zlib.decompress(raw))
+                # 验证必要 key
+                missing = [k for k in ['rgb', 'depth', 'agent_pos', 'point_cloud'] if k not in obs]
+                if missing:
+                    print(f"[Server] Error: Missing keys in obs: {missing}")
+                    socket.send(b"ERROR")
+                    continue
+            except Exception as e:
+                print(f"[Server] Deserialise error: {e}")
+                socket.send(b"ERROR")
+                continue
+
+            try:
+                action = planner.process(obs)
+            except Exception:
+                traceback.print_exc()
+                action = np.array([0, 0, 0, 1, 0, 0, 0, 1, 0, 0], dtype=np.float32)
+
+            reply = {
+                'shape': action.shape,
+                'dtype': str(action.dtype),
+                'data' : action.tobytes(),
+            }
+            socket.send(zlib.compress(pickle.dumps(reply, protocol=pickle.HIGHEST_PROTOCOL)))
+        else:
+            # Keep UI responsive if no data is coming
+            if planner.visualizer:
+                planner.visualizer.update()
+
+
+if __name__ == "__main__":
+    main()

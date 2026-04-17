@@ -1,0 +1,527 @@
+<robot name="partnet_4fd61ff0aa949a4486d53ab0fe94e911">
+	<link name="base"><inertial><origin xyz="0 0 0" rpy="0 0 0" /><mass value="1.0" /><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01" /></inertial></link>
+	<link name="link_0">
+		<visual name="drawer_front-23">
+			<origin xyz="-0.00294 -0.31501 0.55093" />
+			<geometry>
+				<box size="0.78496 0.50909 0.03413" /></geometry>
+		</visual>
+		<visual name="drawer_front-23">
+			<origin xyz="-0.00294 -0.31643 0.52249" />
+			<geometry>
+				<box size="0.57450 0.36404 0.02275" /></geometry>
+		</visual>
+		<visual name="drawer_side-24">
+			<origin xyz="0.29568 -0.31643 0.07882" />
+			<geometry>
+				<box size="0.02275 0.36404 0.91010" /></geometry>
+		</visual>
+		<visual name="drawer_side-25">
+			<origin xyz="-0.30157 -0.31643 0.07882" />
+			<geometry>
+				<box size="0.02275 0.36404 0.91010" /></geometry>
+		</visual>
+		<visual name="drawer_back-26">
+			<origin xyz="-0.00294 -0.31643 -0.36486" />
+			<geometry>
+				<box size="0.57450 0.36404 0.02275" /></geometry>
+		</visual>
+		<visual name="drawer_bottom-27">
+			<origin xyz="-0.00294 -0.46717 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</visual>
+		<visual name="drawer_bottom-27">
+			<origin xyz="-0.00294 -0.47570 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</visual>
+		<visual name="handle-22">
+			<origin xyz="-0.00294 -0.31501 0.59093" />
+			<geometry>
+				<box size="0.21416 0.02105 0.04587" /></geometry>
+		</visual>
+		<collision>
+			<origin xyz="-0.00294 -0.31501 0.55093" />
+			<geometry>
+				<box size="0.78496 0.50909 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.31643 0.52249" />
+			<geometry>
+				<box size="0.57450 0.36404 0.02275" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="0.29568 -0.31643 0.07882" />
+			<geometry>
+				<box size="0.02275 0.36404 0.91010" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.30157 -0.31643 0.07882" />
+			<geometry>
+				<box size="0.02275 0.36404 0.91010" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.31643 -0.36486" />
+			<geometry>
+				<box size="0.57450 0.36404 0.02275" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.46717 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.47570 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.31501 0.59093" />
+			<geometry>
+				<box size="0.21416 0.02105 0.04587" /></geometry>
+		</collision>
+	<inertial><origin xyz="0 0 0" rpy="0 0 0" /><mass value="1.0" /><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01" /></inertial></link>
+	<joint name="joint_0" type="prismatic">
+		<origin xyz="0 0 0" />
+		<axis xyz="0 0 1" />
+		<child link="link_0" />
+		<parent link="link_3" />
+		<limit lower="0" upper="0.8" />
+	</joint>
+	<link name="link_1">
+		<visual name="drawer_front-16">
+			<origin xyz="-0.00294 0.19834 0.55093" />
+			<geometry>
+				<box size="0.78496 0.48349 0.03413" /></geometry>
+		</visual>
+		<visual name="drawer_front-16">
+			<origin xyz="-0.00294 0.18981 0.52249" />
+			<geometry>
+				<box size="0.57450 0.36404 0.02275" /></geometry>
+		</visual>
+		<visual name="drawer_side-17">
+			<origin xyz="0.29568 0.18981 0.07882" />
+			<geometry>
+				<box size="0.02275 0.36404 0.91010" /></geometry>
+		</visual>
+		<visual name="drawer_side-18">
+			<origin xyz="-0.30157 0.18981 0.07882" />
+			<geometry>
+				<box size="0.02275 0.36404 0.91010" /></geometry>
+		</visual>
+		<visual name="drawer_back-19">
+			<origin xyz="-0.00294 0.18981 -0.36486" />
+			<geometry>
+				<box size="0.57450 0.36404 0.02275" /></geometry>
+		</visual>
+		<visual name="drawer_bottom-20">
+			<origin xyz="-0.00294 0.03054 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</visual>
+		<visual name="drawer_bottom-20">
+			<origin xyz="-0.00294 0.03908 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</visual>
+		<visual name="handle-15">
+			<origin xyz="-0.00294 0.19834 0.59093" />
+			<geometry>
+				<box size="0.21416 0.02105 0.04587" /></geometry>
+		</visual>
+		<collision>
+			<origin xyz="-0.00294 0.19834 0.55093" />
+			<geometry>
+				<box size="0.78496 0.48349 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.18981 0.52249" />
+			<geometry>
+				<box size="0.57450 0.36404 0.02275" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="0.29568 0.18981 0.07882" />
+			<geometry>
+				<box size="0.02275 0.36404 0.91010" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.30157 0.18981 0.07882" />
+			<geometry>
+				<box size="0.02275 0.36404 0.91010" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.18981 -0.36486" />
+			<geometry>
+				<box size="0.57450 0.36404 0.02275" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.03054 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.03908 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.19834 0.59093" />
+			<geometry>
+				<box size="0.21416 0.02105 0.04587" /></geometry>
+		</collision>
+	<inertial><origin xyz="0 0 0" rpy="0 0 0" /><mass value="1.0" /><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01" /></inertial></link>
+	<joint name="joint_1" type="prismatic">
+		<origin xyz="0 0 0" />
+		<axis xyz="0 0 1" />
+		<child link="link_1" />
+		<parent link="link_3" />
+		<limit lower="0" upper="0.8" />
+	</joint>
+	<link name="link_2">
+		<visual name="drawer_front-9">
+			<origin xyz="-0.00294 0.60505 0.52249" />
+			<geometry>
+				<box size="0.57450 0.13652 0.02275" /></geometry>
+		</visual>
+		<visual name="drawer_front-9">
+			<origin xyz="-0.00294 0.60931 0.55093" />
+			<geometry>
+				<box size="0.78496 0.30432 0.03413" /></geometry>
+		</visual>
+		<visual name="drawer_side-10">
+			<origin xyz="0.29568 0.60505 0.07882" />
+			<geometry>
+				<box size="0.02275 0.13652 0.91010" /></geometry>
+		</visual>
+		<visual name="drawer_side-11">
+			<origin xyz="-0.30157 0.60505 0.07882" />
+			<geometry>
+				<box size="0.02275 0.13652 0.91010" /></geometry>
+		</visual>
+		<visual name="drawer_back-12">
+			<origin xyz="-0.00294 0.60505 -0.36486" />
+			<geometry>
+				<box size="0.57450 0.13652 0.02275" /></geometry>
+		</visual>
+		<visual name="drawer_bottom-13">
+			<origin xyz="-0.00294 0.56807 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</visual>
+		<visual name="drawer_bottom-13">
+			<origin xyz="-0.00294 0.55954 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</visual>
+		<visual name="handle-8">
+			<origin xyz="-0.00294 0.60931 0.59093" />
+			<geometry>
+				<box size="0.21416 0.02105 0.04587" /></geometry>
+		</visual>
+		<collision>
+			<origin xyz="-0.00294 0.60505 0.52249" />
+			<geometry>
+				<box size="0.57450 0.13652 0.02275" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.60931 0.55093" />
+			<geometry>
+				<box size="0.78496 0.30432 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="0.29568 0.60505 0.07882" />
+			<geometry>
+				<box size="0.02275 0.13652 0.91010" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.30157 0.60505 0.07882" />
+			<geometry>
+				<box size="0.02275 0.13652 0.91010" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.60505 -0.36486" />
+			<geometry>
+				<box size="0.57450 0.13652 0.02275" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.56807 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.55954 0.07882" />
+			<geometry>
+				<box size="0.57450 0.00100 0.86460" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.60931 0.59093" />
+			<geometry>
+				<box size="0.21416 0.02105 0.04587" /></geometry>
+		</collision>
+	<inertial><origin xyz="0 0 0" rpy="0 0 0" /><mass value="1.0" /><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01" /></inertial></link>
+	<joint name="joint_2" type="prismatic">
+		<origin xyz="0 0 0" />
+		<axis xyz="0 0 1" />
+		<child link="link_2" />
+		<parent link="link_3" />
+		<limit lower="0" upper="0.8" />
+	</joint>
+	<link name="link_3">
+		<visual name="frame_vertical_bar-38">
+			<origin xyz="0.37247 0.09596 0.51681" />
+			<geometry>
+				<box size="0.06826 1.36515 0.03413" /></geometry>
+		</visual>
+		<visual name="frame_vertical_bar-39">
+			<origin xyz="-0.37836 0.09596 0.51681" />
+			<geometry>
+				<box size="0.06826 1.36515 0.03413" /></geometry>
+		</visual>
+		<visual name="frame_horizontal_bar-40">
+			<origin xyz="-0.00294 0.71028 -0.54119" />
+			<geometry>
+				<box size="0.76221 0.13651 0.03413" /></geometry>
+		</visual>
+		<visual name="frame_horizontal_bar-41">
+			<origin xyz="-0.00294 -0.55249 0.51681" />
+			<geometry>
+				<box size="0.68258 0.06826 0.03413" /></geometry>
+		</visual>
+		<visual name="frame_horizontal_bar-42">
+			<origin xyz="-0.00294 -0.04625 0.51681" />
+			<geometry>
+				<box size="0.68258 0.06826 0.03413" /></geometry>
+		</visual>
+		<visual name="frame_horizontal_bar-43">
+			<origin xyz="-0.00294 0.44862 0.51681" />
+			<geometry>
+				<box size="0.68258 0.06826 0.03413" /></geometry>
+		</visual>
+		<visual name="frame_horizontal_bar-44">
+			<origin xyz="-0.00294 0.74441 0.51681" />
+			<geometry>
+				<box size="0.68258 0.06826 0.03413" /></geometry>
+		</visual>
+		<visual name="other_leaf-52">
+			<origin xyz="0.30990 0.73303 0.43148" />
+			<geometry>
+				<box size="0.13652 0.02275 0.13652" /></geometry>
+		</visual>
+		<visual name="other_leaf-51">
+			<origin xyz="-0.31579 0.73303 0.43148" />
+			<geometry>
+				<box size="0.13651 0.02275 0.13652" /></geometry>
+		</visual>
+		<visual name="other_leaf-50">
+			<origin xyz="0.30990 0.73303 -0.45587" />
+			<geometry>
+				<box size="0.13652 0.02275 0.13651" /></geometry>
+		</visual>
+		<visual name="other_leaf-49">
+			<origin xyz="-0.31579 0.73303 -0.45587" />
+			<geometry>
+				<box size="0.13651 0.02275 0.13651" /></geometry>
+		</visual>
+		<visual name="vertical_side_panel-53">
+			<origin xyz="-0.39258 0.09596 -0.08329" />
+			<geometry>
+				<box size="0.01706 1.36515 0.94992" /></geometry>
+		</visual>
+		<visual name="vertical_side_panel-53">
+			<origin xyz="-0.39258 0.09596 0.44570" />
+			<geometry>
+				<box size="0.01706 1.36515 0.10807" /></geometry>
+		</visual>
+		<visual name="vertical_side_panel-54">
+			<origin xyz="0.38669 0.09596 0.44570" />
+			<geometry>
+				<box size="0.01706 1.36515 0.10807" /></geometry>
+		</visual>
+		<visual name="vertical_side_panel-54">
+			<origin xyz="0.38669 0.09596 -0.08329" />
+			<geometry>
+				<box size="0.01706 1.36515 0.94992" /></geometry>
+		</visual>
+		<visual name="back_panel-55">
+			<origin xyz="-0.00294 0.08458 -0.51844" />
+			<geometry>
+				<box size="0.76221 1.27414 0.01138" /></geometry>
+		</visual>
+		<visual name="bottom_panel-56">
+			<origin xyz="-0.00294 -0.54111 -0.00650" />
+			<geometry>
+				<box size="0.76221 0.02275 1.01249" /></geometry>
+		</visual>
+		<visual name="other_leaf-64">
+			<origin xyz="-0.24185 -0.43190 -0.52412" />
+			<geometry>
+				<box size="0.27303 0.18430 0.00100" /></geometry>
+		</visual>
+		<visual name="other_leaf-63">
+			<origin xyz="-0.31295 -0.19129 0.43190" />
+			<geometry>
+				<box size="0.00100 0.04550 0.06742" /></geometry>
+		</visual>
+		<visual name="other_leaf-62">
+			<origin xyz="-0.31295 0.31495 0.43190" />
+			<geometry>
+				<box size="0.00100 0.04551 0.06742" /></geometry>
+		</visual>
+		<visual name="other_leaf-61">
+			<origin xyz="-0.31295 0.61642 0.43190" />
+			<geometry>
+				<box size="0.00100 0.04551 0.06742" /></geometry>
+		</visual>
+		<visual name="base_side_panel-29">
+			<origin xyz="0.38669 -0.68901 -0.08329" />
+			<geometry>
+				<box size="0.01706 0.20477 0.94992" /></geometry>
+		</visual>
+		<visual name="base_side_panel-30">
+			<origin xyz="-0.00294 -0.65772 -0.54119" />
+			<geometry>
+				<box size="0.76221 0.26734 0.03413" /></geometry>
+		</visual>
+		<visual name="base_side_panel-31">
+			<origin xyz="-0.39258 -0.68901 -0.08329" />
+			<geometry>
+				<box size="0.01706 0.20477 0.94992" /></geometry>
+		</visual>
+		<visual name="base_side_panel-32">
+			<origin xyz="-0.00294 -0.67194 0.38313" />
+			<geometry>
+				<box size="0.76221 0.23890 0.01706" /></geometry>
+		</visual>
+		<collision>
+			<origin xyz="0.37247 0.09596 0.51681" />
+			<geometry>
+				<box size="0.06826 1.36515 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.37836 0.09596 0.51681" />
+			<geometry>
+				<box size="0.06826 1.36515 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.71028 -0.54119" />
+			<geometry>
+				<box size="0.76221 0.13651 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.55249 0.51681" />
+			<geometry>
+				<box size="0.68258 0.06826 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.04625 0.51681" />
+			<geometry>
+				<box size="0.68258 0.06826 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.44862 0.51681" />
+			<geometry>
+				<box size="0.68258 0.06826 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.74441 0.51681" />
+			<geometry>
+				<box size="0.68258 0.06826 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="0.30990 0.73303 0.43148" />
+			<geometry>
+				<box size="0.13652 0.02275 0.13652" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.31579 0.73303 0.43148" />
+			<geometry>
+				<box size="0.13651 0.02275 0.13652" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="0.30990 0.73303 -0.45587" />
+			<geometry>
+				<box size="0.13652 0.02275 0.13651" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.31579 0.73303 -0.45587" />
+			<geometry>
+				<box size="0.13651 0.02275 0.13651" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.39258 0.09596 -0.08329" />
+			<geometry>
+				<box size="0.01706 1.36515 0.94992" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.39258 0.09596 0.44570" />
+			<geometry>
+				<box size="0.01706 1.36515 0.10807" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="0.38669 0.09596 0.44570" />
+			<geometry>
+				<box size="0.01706 1.36515 0.10807" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="0.38669 0.09596 -0.08329" />
+			<geometry>
+				<box size="0.01706 1.36515 0.94992" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 0.08458 -0.51844" />
+			<geometry>
+				<box size="0.76221 1.27414 0.01138" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.54111 -0.00650" />
+			<geometry>
+				<box size="0.76221 0.02275 1.01249" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.24185 -0.43190 -0.52412" />
+			<geometry>
+				<box size="0.27303 0.18430 0.00100" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.31295 -0.19129 0.43190" />
+			<geometry>
+				<box size="0.00100 0.04550 0.06742" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.31295 0.31495 0.43190" />
+			<geometry>
+				<box size="0.00100 0.04551 0.06742" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.31295 0.61642 0.43190" />
+			<geometry>
+				<box size="0.00100 0.04551 0.06742" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="0.38669 -0.68901 -0.08329" />
+			<geometry>
+				<box size="0.01706 0.20477 0.94992" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.65772 -0.54119" />
+			<geometry>
+				<box size="0.76221 0.26734 0.03413" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.39258 -0.68901 -0.08329" />
+			<geometry>
+				<box size="0.01706 0.20477 0.94992" /></geometry>
+		</collision>
+		<collision>
+			<origin xyz="-0.00294 -0.67194 0.38313" />
+			<geometry>
+				<box size="0.76221 0.23890 0.01706" /></geometry>
+		</collision>
+	<inertial><origin xyz="0 0 0" rpy="0 0 0" /><mass value="1.0" /><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01" /></inertial></link>
+	<joint name="joint_3" type="fixed">
+		<origin rpy="1.570796326794897 0 -1.570796326794897" xyz="0 0 0" />
+		<child link="link_3" />
+		<parent link="base" />
+	</joint>
+<mujoco><compiler meshdir="textured_objs" discardvisual="true" /></mujoco></robot>

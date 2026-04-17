@@ -1,0 +1,101 @@
+<mujoco model="partnet_3cdabe258ed67a144da5feafe6f1c8fc">
+  <compiler angle="radian" />
+
+  <asset>
+    <mesh name="original-51_vhacd" content_type="model/obj" file="original-51_vhacd.obj" />
+    <mesh name="original-46_vhacd" content_type="model/obj" file="original-46_vhacd.obj" />
+    <mesh name="original-47_vhacd" content_type="model/obj" file="original-47_vhacd.obj" />
+    <mesh name="original-45_vhacd" content_type="model/obj" file="original-45_vhacd.obj" />
+    <mesh name="original-48_vhacd" content_type="model/obj" file="original-48_vhacd.obj" />
+    <mesh name="original-50_vhacd" content_type="model/obj" file="original-50_vhacd.obj" />
+    <mesh name="handle_modified_Translation_Mesh_X_1_5_52" content_type="model/obj" file="handle_modified_Translation_Mesh_X_1_5_52.obj" />
+    <mesh name="original-42_vhacd" content_type="model/obj" file="original-42_vhacd.obj" />
+    <mesh name="original-38_vhacd" content_type="model/obj" file="original-38_vhacd.obj" />
+    <mesh name="original-39_vhacd" content_type="model/obj" file="original-39_vhacd.obj" />
+    <mesh name="original-36_vhacd" content_type="model/obj" file="original-36_vhacd.obj" />
+    <mesh name="original-37_vhacd" content_type="model/obj" file="original-37_vhacd.obj" />
+    <mesh name="original-41_vhacd" content_type="model/obj" file="original-41_vhacd.obj" />
+    <mesh name="original-28_vhacd" content_type="model/obj" file="original-28_vhacd.obj" />
+    <mesh name="original-27_vhacd" content_type="model/obj" file="original-27_vhacd.obj" />
+    <mesh name="original-32_vhacd" content_type="model/obj" file="original-32_vhacd.obj" />
+    <mesh name="original-34_vhacd" content_type="model/obj" file="original-34_vhacd.obj" />
+    <mesh name="original-33_vhacd" content_type="model/obj" file="original-33_vhacd.obj" />
+    <mesh name="original-31_vhacd" content_type="model/obj" file="original-31_vhacd.obj" />
+    <mesh name="original-30_vhacd" content_type="model/obj" file="original-30_vhacd.obj" />
+    <mesh name="original-43_vhacd" content_type="model/obj" file="original-43_vhacd.obj" />
+    <mesh name="original-2_vhacd" content_type="model/obj" file="original-2_vhacd.obj" />
+    <mesh name="original-16_vhacd" content_type="model/obj" file="original-16_vhacd.obj" />
+    <mesh name="original-15_vhacd" content_type="model/obj" file="original-15_vhacd.obj" />
+    <mesh name="original-12_vhacd" content_type="model/obj" file="original-12_vhacd.obj" />
+    <mesh name="original-11_vhacd" content_type="model/obj" file="original-11_vhacd.obj" />
+    <mesh name="original-6_vhacd" content_type="model/obj" file="original-6_vhacd.obj" />
+    <mesh name="original-3_vhacd" content_type="model/obj" file="original-3_vhacd.obj" />
+    <mesh name="original-8_vhacd" content_type="model/obj" file="original-8_vhacd.obj" />
+    <mesh name="original-18_vhacd" content_type="model/obj" file="original-18_vhacd.obj" />
+    <mesh name="original-9_vhacd" content_type="model/obj" file="original-9_vhacd.obj" />
+    <mesh name="original-22_vhacd" content_type="model/obj" file="original-22_vhacd.obj" />
+    <mesh name="original-5_vhacd" content_type="model/obj" file="original-5_vhacd.obj" />
+    <mesh name="original-21_vhacd" content_type="model/obj" file="original-21_vhacd.obj" />
+    <mesh name="original-7_vhacd" content_type="model/obj" file="original-7_vhacd.obj" />
+    <mesh name="original-4_vhacd" content_type="model/obj" file="original-4_vhacd.obj" />
+    <mesh name="original-23_vhacd" content_type="model/obj" file="original-23_vhacd.obj" />
+    <mesh name="original-24_vhacd" content_type="model/obj" file="original-24_vhacd.obj" />
+    <mesh name="original-53_vhacd" content_type="model/obj" file="original-53_vhacd.obj" />
+    <mesh name="original-19_vhacd" content_type="model/obj" file="original-19_vhacd.obj" />
+    <mesh name="original-13_vhacd" content_type="model/obj" file="original-13_vhacd.obj" />
+    <mesh name="original-20_vhacd" content_type="model/obj" file="original-20_vhacd.obj" />
+    <mesh name="original-17_vhacd" content_type="model/obj" file="original-17_vhacd.obj" />
+  <texture name="grid" type="2d" builtin="checker" rgb1=".1 .1 .1" rgb2=".2 .2 .2" width="512" height="512" /><material name="grid" texture="grid" texrepeat="5 5" /></asset>
+
+  <worldbody>
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-2_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-16_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-15_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-12_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-11_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-6_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-3_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-8_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-18_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-9_vhacd" />
+    <geom quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-22_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-5_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-21_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-7_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-4_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-23_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-24_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-53_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-19_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-13_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-20_vhacd" />
+    <geom pos="0 0 0" quat="0.5 0.5 -0.5 -0.5" type="mesh" mesh="original-17_vhacd" />
+    <body name="link_0" pos="-0.387727 0.0692516 0" quat="0.5 0.5 -0.5 -0.5">
+      <joint name="joint_0" pos="0 0 0" axis="0 1 0" range="0 1.5708" />
+      <geom pos="0.0692516 0 -0.387727" quat="1 0 0 0" type="mesh" mesh="original-51_vhacd" />
+      <geom pos="0.0692516 0 -0.387727" quat="1 0 0 0" type="mesh" mesh="original-46_vhacd" />
+      <geom pos="0.0692516 0 -0.387727" quat="1 0 0 0" type="mesh" mesh="original-47_vhacd" />
+      <geom pos="0.0692516 0 -0.387727" quat="1 0 0 0" type="mesh" mesh="original-45_vhacd" />
+      <geom pos="0.0692516 0 -0.387727" quat="1 0 0 0" type="mesh" mesh="original-48_vhacd" />
+      <geom pos="0.0692516 0 -0.387727" quat="1 0 0 0" type="mesh" mesh="original-50_vhacd" />
+      <geom pos="0.0692516 0 -0.387727" quat="1 0 0 0" type="mesh" mesh="handle_modified_Translation_Mesh_X_1_5_52" />
+    </body>
+    <body name="link_1" quat="0.5 0.5 -0.5 -0.5">
+      <joint name="joint_1" pos="0 0 0" axis="0 0 1" type="slide" range="0 0.6" />
+      <geom type="mesh" mesh="original-42_vhacd" />
+      <geom type="mesh" mesh="original-38_vhacd" />
+      <geom type="mesh" mesh="original-39_vhacd" />
+      <geom type="mesh" mesh="original-36_vhacd" />
+      <geom type="mesh" mesh="original-37_vhacd" />
+      <geom type="mesh" mesh="original-41_vhacd" />
+      <geom type="mesh" mesh="original-28_vhacd" />
+      <geom type="mesh" mesh="original-27_vhacd" />
+      <geom type="mesh" mesh="original-32_vhacd" />
+      <geom type="mesh" mesh="original-34_vhacd" />
+      <geom type="mesh" mesh="original-33_vhacd" />
+      <geom type="mesh" mesh="original-31_vhacd" />
+      <geom type="mesh" mesh="original-30_vhacd" />
+      <geom type="mesh" mesh="original-43_vhacd" />
+    </body>
+  <geom name="floor" type="plane" pos="0 0 0" size="5 5 0.05" material="grid" /><light diffuse=".8 .8 .8" pos="0 0 5" dir="0 0 -1" castshadow="true" ambient=".3 .3 .3" /></worldbody>
+<visual><quality shadowsize="4096" /></visual></mujoco>

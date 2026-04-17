@@ -1,0 +1,5 @@
+__pycache__/
+.claude/
+mujoco_menagerie/
+data/
+test_drawer_rgbd/
