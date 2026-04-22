@@ -3,3 +3,6 @@ __pycache__/
 mujoco_menagerie/
 data/
 test_drawer_rgbd/
+out/
+out_rear_right/
+out_batch/
