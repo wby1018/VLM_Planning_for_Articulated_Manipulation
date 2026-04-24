@@ -44,8 +44,8 @@ from scipy.spatial.transform import Rotation as R
 
 ZMQ_PORT         = 5555
 DET_SERVER_URL   = "http://127.0.0.1:8000/detect"
-DET_QUERIES      = ["handle", "drawer handle", "door handle", "drawer", "cabinet door"]
-DET_THRESHOLD    = 0.25
+DET_QUERIES      = ["handle", "drawer", "cabinet door"]
+DET_THRESHOLD    = 0.2
 
 USE_VISUALIZER   = True
 
@@ -328,19 +328,86 @@ def call_detection(rgb_bgr: np.ndarray) -> List[Dict[str, Any]]:
 
 def draw_annotated_image(rgb_bgr: np.ndarray,
                           detections: List[Dict]) -> np.ndarray:
-    """Overlay bbox + numeric ID labels for the VLM."""
+    """
+    Cleaner visualization: 
+    1. Draw only high-contrast bboxes and small IDs on the main image.
+    2. Add a structured legend in the corner showing [ID]: Label (Score).
+    """
+    H, W = rgb_bgr.shape[:2]
     out = rgb_bgr.copy()
+    
+    # 高对比度色板 (BGR 格式)
+    PALETTE = [
+        (0, 0, 255),      # 红
+        (0, 255, 0),      # 绿
+        (255, 0, 0),      # 蓝
+        (0, 255, 255),    # 黄
+        (255, 0, 255),    # 品红
+        (255, 255, 0),    # 青
+        (0, 165, 255),    # 橘
+        (203, 192, 255),  # 粉
+        (128, 0, 128),    # 紫
+        (128, 128, 0),    # 深青
+        (0, 128, 0),      # 暗绿
+        (0, 0, 128),      # 深红
+    ]
+
+    legend_items = []
+    
     for det in detections:
-        idx     = det.get("index", "?")
-        x1, y1, x2, y2 = det["box"]
-        label   = det["detection"][0]["label"]
-        score   = det["detection"][0]["score"]
-        text    = f"[{idx}] {label} {score:.2f}"
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 220, 0), 2)
-        cv2.rectangle(out, (x1, y1 - th - 5), (x1 + tw + 3, y1), (0, 220, 0), -1)
-        cv2.putText(out, text, (x1 + 1, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+        idx = det.get("index", 0)
+        color = PALETTE[int(idx) % len(PALETTE)]
+        
+        x1, y1, x2, y2 = [int(v) for v in det["box"]]
+        label = det["detection"][0]["label"]
+        score = det["detection"][0]["score"]
+        
+        # 1. 绘制极简边界框
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        
+        # 2. 在框左上角画一个小 ID 标识 (背景色块 + 白色文字)
+        id_text = f"{idx}"
+        (tw, th), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        cv2.rectangle(out, (x1, y1), (x1 + tw + 4, y1 + th + 4), color, -1)
+        cv2.putText(out, id_text, (x1 + 2, y1 + th + 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        legend_items.append({
+            "id": idx,
+            "label": label,
+            "score": score,
+            "color": color
+        })
+
+    # 3. 绘制角落图例 (Legend)
+    if legend_items:
+        margin = 10
+        item_h = 24
+        header_h = 25
+        leg_w  = 200
+        leg_h  = header_h + len(legend_items) * item_h + margin
+        
+        # 图例底色 (半透明黑)
+        leg_x1 = W - leg_w - margin
+        leg_y1 = margin
+        overlay = out.copy()
+        cv2.rectangle(overlay, (leg_x1, leg_y1), (leg_x1 + leg_w, leg_y1 + leg_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, out, 0.4, 0, out)
+        
+        # 标题
+        cv2.putText(out, "LEGEND", (leg_x1 + 5, leg_y1 + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+        
+        # 列表条目
+        for i, item in enumerate(legend_items):
+            iy = leg_y1 + header_h + i * item_h + 15
+            # 画一个颜色小方块
+            cv2.rectangle(out, (leg_x1 + 8, iy - 10), (leg_x1 + 20, iy + 2), item["color"], -1)
+            # 画文字
+            text = f"[{item['id']}] {item['label']} ({item['score']:.2f})"
+            cv2.putText(out, text, (leg_x1 + 28, iy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
     return out
 
 # ─────────────────────────── Visualization ────────────────────────────────────

@@ -3,3 +3,8 @@ __pycache__/
 mujoco_menagerie/
 data/
 test_drawer_rgbd/
+record_pull_arc_with_joint_0/
+tapip_results/
+TAPIP3D/
+tests/particle_filter_for_screw_test.zip/
+co-tracker/
