@@ -8,3 +8,6 @@ tapip_results/
 TAPIP3D/
 tests/particle_filter_for_screw_test.zip/
 co-tracker/
+anygrasp_sdk/
+GAMMA-ICRA2024/
+Pointnet2_PyTorch/

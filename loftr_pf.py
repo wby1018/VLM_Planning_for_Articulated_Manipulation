@@ -42,10 +42,10 @@ CONNECTIONS = [
 # PF 超参数
 N_PARTICLES    = 500
 SIGMA_KIN      = 0.003   # 夹爪 3D 重投影误差标准差 (m)
-SIGMA_RAD      = 0.05  # 半径一致性误差标准差 (m)，强约束
+SIGMA_RAD      = 0.001  # 半径一致性误差标准差 (m)，强约束
 SIGMA_VIS      = 0.001  # 视觉点云误差标准差 (m) (原 0.01，调小以增加权重)
-PROC_NOISE_W   = 1e-3   # 极小值，锁定转轴方向 (几乎不动)
-PROC_NOISE_V   = 1e-2   # 较大值，允许转轴位置快速平移收敛 (快速变)
+PROC_NOISE_W   = 1e-8   # 极小值，锁定转轴方向 (几乎不动)
+PROC_NOISE_V   = 1e-5   # 较大值，允许转轴位置快速平移收敛 (快速变)
 PROC_NOISE_T   = 5e-3   # theta 噪声
 ESS_RATIO      = 0.9    # 有效粒子数比例阈值，低于此重采样
 
@@ -835,7 +835,7 @@ class LoFTRAxisEstimator:
 # Demo main（与之前逻辑完全等价）
 # =============================================================================
 
-def main(visualize: bool = True):
+def main(visualize: bool = True, step: int = 1):
     """
     从 DATA_ROOT 加载录制数据，演示 LoFTRAxisEstimator 的调用方式。
 
@@ -854,8 +854,8 @@ def main(visualize: bool = True):
     print(f"[Main] 共 {len(depth_files)} 帧")
 
     # 硬编码初始转轴参数
-    p0     = np.array([0.8, 0.5, 0.0])
-    omega0 = np.array([0.0, 0.2, 0.8])
+    p0     = np.array([0.9, 0.4, 0.0])
+    omega0 = np.array([0.0, 0.0, 1.0])
 
     estimator = LoFTRAxisEstimator(
         K         = K,
@@ -866,7 +866,7 @@ def main(visualize: bool = True):
         visualize = visualize,
     )
 
-    for depth_file in depth_files:
+    for depth_file in depth_files[::step]:
         frame_id = int(depth_file.stem.split("_")[-1])
         if frame_id not in cam_poses or frame_id not in link_poses_all:
             continue
@@ -894,5 +894,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-vis', action='store_true', help='禁用可视化窗口')
+    parser.add_argument('--step', type=int, default=1, help='处理数据集时的步长 (默认 1)')
     args = parser.parse_args()
-    main(visualize=not args.no_vis)
+    main(visualize=not args.no_vis, step=args.step)

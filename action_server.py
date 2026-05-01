@@ -28,7 +28,10 @@ Server → Client  compressed pickle of action_dict:
 
 import base64
 import json
+import os
 import pickle
+import queue
+import threading
 import traceback
 import zlib
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,18 +41,23 @@ import numpy as np
 import requests
 import zmq
 import matplotlib.pyplot as plt
+from openai import OpenAI
 from scipy.spatial.transform import Rotation as R
+
+from loftr_pf import LoFTRAxisEstimator
 
 # ─────────────────────────── Configuration ────────────────────────────────────
 
 ZMQ_PORT         = 5555
 DET_SERVER_URL   = "http://127.0.0.1:8000/detect"
 DET_QUERIES      = ["handle", "drawer", "cabinet door"]
+
+VLM_MODEL        = "gpt-5.4"   # model name used by the Responses API
 DET_THRESHOLD    = 0.2
 
 USE_VISUALIZER   = True
 
-USER_INSTRUCTION = "open the bottom drawer"
+USER_INSTRUCTION = "open the cabinet door"
 
 # Motion tuning
 APPROACH_DIST   = 0.20   # m — standoff before grasping
@@ -64,7 +72,7 @@ GRIPPER_DELTA   = 0.003  # m per step
 GRIPPER_OPEN    = 0.04
 GRIPPER_CLOSED  = 0.000
 GRASP_OFFSET    = 0.085  # m — distance from Panda 'hand' frame to finger tips
-TARGET_Z_OFFSET = 0.02   # m — upward shift of the target grasp point
+TARGET_Z_OFFSET = 0.01   # m — upward shift of the target grasp point
 NORMAL_SCAN_RADIUS = 0.15 # m — radius around handle to sample panel points
 
 PULL_LINEAR_DIST = 0.38  # m total drawer pull
@@ -365,12 +373,15 @@ def draw_annotated_image(rgb_bgr: np.ndarray,
         # 1. 绘制极简边界框
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         
-        # 2. 在框左上角画一个小 ID 标识 (背景色块 + 白色文字)
+        # 2. 在框左上角画一个小 ID 标识 (背景色块 + 负色文字)
         id_text = f"{idx}"
         (tw, th), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
         cv2.rectangle(out, (x1, y1), (x1 + tw + 4, y1 + th + 4), color, -1)
+        
+        # 使用负色计算文字颜色以确保高对比度
+        text_color = (255 - color[0], 255 - color[1], 255 - color[2])
         cv2.putText(out, id_text, (x1 + 2, y1 + th + 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, text_color, 1, cv2.LINE_AA)
         
         legend_items.append({
             "id": idx,
@@ -517,8 +528,8 @@ language instruction, generate a structured JSON plan to operate drawers or cabi
    - `valid_action`: `Pull_Arc`
 
 **Gripper Orientation Logic**:
-- `Horizontal`: Select if the handle's width is significantly greater than its height.
-- `Vertical`: Select if the handle's height >= width, or if it is a knob/square shape.
+- `Vertical`: Select if the handle's width is significantly greater than its height.
+- `Horizontal`: Select if the handle's height >= width, or if it is a knob/square shape.
 
 **Strict Constraints**:
 1. **Valid Stages**: ONLY use these: ["MoveTo", "Grasp", "Pull_Linear", "Pull_Arc", "Release"]
@@ -537,56 +548,117 @@ language instruction, generate a structured JSON plan to operate drawers or cabi
 **User Instruction**: """
 
 
+def _image_bgr_to_data_url(bgr: np.ndarray) -> str:
+    """Encode a BGR numpy image as a base64 JPEG data URL for the Responses API."""
+    _, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+    return f"data:image/jpeg;base64,{b64}"
+
+
 def call_vlm(annotated_bgr: np.ndarray, user_instruction: str,
-             detections: List[Dict]) -> Dict[str, Any]:
+             detections: List[Dict],
+             use_api: bool = True) -> Dict[str, Any]:
     """
-    Call the VLM API with the annotated image and user instruction.
+    Call the VLM with the annotated image and user instruction.
 
-    TODO: Replace the stub below with a real API call, e.g.:
-
-        import base64, openai
-        _, buf = cv2.imencode('.jpg', annotated_bgr)
-        img_b64 = base64.b64encode(buf.tobytes()).decode()
-        client = openai.OpenAI(api_key=..., base_url=...)
-        resp = client.chat.completions.create(
-            model="qwen-vl-plus",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url",
-                     "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    {"type": "text",
-                     "text": VLM_SYSTEM_PROMPT + user_instruction},
-                ]
-            }]
-        )
-        return json.loads(resp.choices[0].message.content)
+    Parameters
+    ----------
+    use_api : bool
+        If True, call the real OpenAI Responses API (reads OPENAI_API_KEY from env).
+        If False, fall back to the hardcoded default plan.
     """
-    print("[VLM] TODO: VLM API not wired up yet — using heuristic default plan.")
+    if use_api:
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            print("[VLM] WARNING: OPENAI_API_KEY not set — falling back to hardcoded plan.")
+        else:
+            try:
+                client = OpenAI(api_key=api_key)
+                image_data_url = _image_bgr_to_data_url(annotated_bgr)
+                prompt = VLM_SYSTEM_PROMPT + user_instruction
 
-    # Heuristic default: pick the first handle, first drawer/door
-    handle_id = next(
-        (d["index"] for d in detections
-         if "handle" in d["detection"][0]["label"].lower()), 0)
-    parent_id = next(
-        (d["index"] for d in detections
-         if any(kw in d["detection"][0]["label"].lower()
-                for kw in ("drawer", "door", "cabinet"))), 1)
+                response = client.responses.create(
+                    model=VLM_MODEL,
+                    input=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": prompt},
+                                {"type": "input_image", "image_url": image_data_url},
+                            ],
+                        }
+                    ],
+                )
+                raw_text = response.output_text.strip()
+                # Strip optional markdown code fences
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.split("```")[1]
+                    if raw_text.startswith("json"):
+                        raw_text = raw_text[4:]
+                plan = json.loads(raw_text)
+                print(f"[VLM] API response: {plan}")
+                return plan
+            except Exception as e:
+                print(f"[VLM] API call failed: {e} — falling back to hardcoded plan.")
 
-    # return {
-    #     "target_handle_id": 6,
-    #     "parent_object_id": 7,
-    #     "motion_type": "Translation",
-    #     "gripper_orientation": "Vertical",
-    #     "plan": ["MoveTo", "Approach", "Grasp", "Pull_Linear", "Release"],
-    # }
-    return {
-        "target_handle_id": 3,
-        "parent_object_id": 2,
-        "motion_type": "Rotation",
-        "gripper_orientation": "Horizontal",
-        "plan": ["MoveTo", "Approach", "Grasp", "Pull_Arc", "Release"],
-    }
+    # ── Hardcoded fallback ────────────────────────────────────────────────────
+    print("[VLM] Using hardcoded default plan.")
+    return {'target_handle_id': 8, 'parent_object_id': 7, 'motion_type': 'Translation', 'gripper_orientation': 'Vertical', 'plan': ['MoveTo', 'Grasp', 'Pull_Linear', 'Release']}
+
+
+# ─────────────────────────── LoFTR Axis Estimator Thread ─────────────────────
+
+class LoFTREstimatorThread:
+    """
+    Background thread that continuously refines the rotation axis using LoFTR-PF.
+
+    Frames are pushed via push(); the latest pivot estimate is readable via
+    get_pivot() at any time.  Drops frames when the particle filter is slower
+    than the control loop so the queue never grows unbounded.
+    """
+
+    def __init__(self, K: np.ndarray, omega0: np.ndarray, p0: np.ndarray):
+        self._estimator = LoFTRAxisEstimator(K, omega0, p0, theta0=0.0, visualize=False)
+        self._queue: queue.Queue = queue.Queue(maxsize=2)
+        self._lock = threading.Lock()
+        self._pivot = np.array(p0, dtype=np.float64).copy()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def push(self, frame_id: int, depth: np.ndarray, rgb_bgr: np.ndarray,
+             c2w: np.ndarray, ee_poses_dict: Dict[int, np.ndarray]) -> None:
+        try:
+            self._queue.put_nowait((frame_id, depth, rgb_bgr, c2w, ee_poses_dict))
+        except queue.Full:
+            pass  # drop frame when thread is still processing the previous one
+
+    def get_pivot(self) -> np.ndarray:
+        with self._lock:
+            return self._pivot.copy()
+
+    def stop(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            frame_id, depth, rgb_bgr, c2w, ee_poses_dict = item
+            try:
+                result = self._estimator.step(
+                    frame_id, depth, rgb_bgr, c2w,
+                    lp_dict={}, ee_poses_dict=ee_poses_dict
+                )
+                if result is not None:
+                    pivot, n_dir, theta, sigma_p, sigma_t = result
+                    with self._lock:
+                        self._pivot = pivot.copy()
+                    print(f"[LoFTR] pivot={np.round(pivot[:2], 3)}  "
+                          f"θ={np.rad2deg(theta):.1f}°  σp={sigma_p * 100:.1f}cm")
+            except Exception as exc:
+                print(f"[LoFTR Thread] frame {frame_id}: {exc}")
+
 
 # ─────────────────────────── Action Planner ───────────────────────────────────
 
@@ -608,10 +680,12 @@ class ActionPlanner:
     Release      : stay in place, gripper opens
     """
 
-    def __init__(self, user_instruction: str = USER_INSTRUCTION, 
-                 use_visualizer: bool = USE_VISUALIZER):
+    def __init__(self, user_instruction: str = USER_INSTRUCTION,
+                 use_visualizer: bool = USE_VISUALIZER,
+                 use_api: bool = True):
         self.user_instruction = user_instruction
         self.use_visualizer = use_visualizer
+        self.use_api = use_api
         self.visualizer = Visualizer3D() if use_visualizer else None
         self._reset()
 
@@ -643,6 +717,12 @@ class ActionPlanner:
 
         rgb_bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
 
+        # Track EE history for LoFTR PF (frame_id → world position)
+        self._frame_id += 1
+        self._ee_history[self._frame_id] = curr_pos.copy()
+        if len(self._ee_history) > 200:
+            del self._ee_history[min(self._ee_history)]
+
         if self.state == "INIT":
             print("[Planner] Entering INIT state, calling backend services...")
             self._initialize(rgb_bgr, depth, cam_pos, cam_mat, fovy,
@@ -652,6 +732,23 @@ class ActionPlanner:
         if self.state in ("ERROR", "DONE"):
             # Return current pose as target to stop: [curr_pos, curr_rot6d, curr_grip]
             return np.concatenate([curr_pos, matrix_to_rot6d(curr_rot), [curr_grip]]).astype(np.float32)
+
+        # ── Feed LoFTR thread and update arc hinge during Pull_Arc ────────
+        if (self.state == "EXECUTING"
+                and self.stage_idx < len(self.stages)
+                and self.stages[self.stage_idx] == "Pull_Arc"
+                and self._loftr_thread is not None):
+            # MuJoCo: camera looks along -Z, Y up  →  CV: looks along +Z, Y down
+            R_flip = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[:3, :3] = cam_mat.astype(np.float32) @ R_flip
+            c2w[:3, 3]  = cam_pos.astype(np.float32)
+            self._loftr_thread.push(
+                self._frame_id, depth.copy(), rgb_bgr.copy(),
+                c2w, self._ee_history.copy()
+            )
+            if self.arc_initialized:
+                self._update_arc_hinge(self._loftr_thread.get_pivot(), curr_pos)
 
         action = self._step(curr_pos, curr_rot, curr_grip)
         
@@ -695,10 +792,14 @@ class ActionPlanner:
         self.arc_hinge        : Optional[np.ndarray] = None
         self.arc_radius       : float = 0.3
         self.arc_current_angle: float = 0.0
-        self.arc_target_angle : float = 0.0
-        self.arc_start_angle  : float = 0.0
-        self.arc_direction    : float = 1.0  # +1 for ccw, -1 for cw
+        self.arc_swept        : float = 0.0   # accumulated sweep (0 → PULL_ARC_ANGLE)
+        self.arc_direction    : float = 1.0   # +1 for ccw, -1 for cw
         self.arc_initialized  : bool  = False
+
+        # LoFTR axis estimator thread (Rotation motion only)
+        self._loftr_thread: Optional[LoFTREstimatorThread] = None
+        self._frame_id    : int  = 0
+        self._ee_history  : Dict[int, np.ndarray] = {}
 
     def _initialize(self, rgb_bgr, depth, cam_pos, cam_mat, fovy,
                     curr_pos, point_cloud):
@@ -720,10 +821,21 @@ class ActionPlanner:
 
         # ── 2. VLM ────────────────────────────────────────────────────────
         print("[Planner] [Step 3/7] Calling VLM reasoning...")
-        plan = call_vlm(annotated, self.user_instruction, self.detections)
+        plan = call_vlm(annotated, self.user_instruction, self.detections,
+                        use_api=self.use_api)
         print(f"[Planner] [Step 3/7] VLM Plan resolved: {plan.get('target_handle_id')}")
         self.plan_data = plan
-        self.stages    = plan["plan"]
+        
+        # 自动补全策略：如果在 MoveTo 之后直接接 Grasp，自动插入 Approach 阶段
+        stages = list(plan["plan"])
+        if "MoveTo" in stages:
+            m_idx = stages.index("MoveTo")
+            # 如果 MoveTo 后面是 Grasp，或者 MoveTo 是最后一项且后面该接 Grasp
+            if m_idx + 1 < len(stages) and stages[m_idx + 1] == "Grasp":
+                print("[Planner] 检测到缺失 Approach 阶段，自动插入...")
+                stages.insert(m_idx + 1, "Approach")
+        
+        self.stages = stages
 
         # ── 3. Resolve handle and parent detections ────────────────────────
         print("[Planner] [Step 4/7] Resolving 3D positions...")
@@ -779,7 +891,17 @@ class ActionPlanner:
                 )
             else:
                 print("[Planner] [WARN] No parent mask for hinge estimation!")
-                self.arc_hinge, self.arc_radius = np.array([0,0,0]), 0.3
+                self.arc_hinge, self.arc_radius = np.array([0,0,0], dtype=np.float64), 0.3
+
+            # Build K from MuJoCo camera params and start LoFTR thread
+            H, W = depth.shape
+            f_cam = (H / 2.0) / np.tan(np.deg2rad(fovy) / 2.0)
+            K = np.array([[f_cam, 0, W / 2.0],
+                          [0, f_cam, H / 2.0],
+                          [0,     0,      1.0]], dtype=np.float32)
+            omega0 = np.array([0.0, 0.0, 1.0])  # vertical door hinge
+            print("[Planner] [Step 7/7] Starting LoFTR axis estimator thread...")
+            self._loftr_thread = LoFTREstimatorThread(K, omega0, self.arc_hinge)
 
         print("[Planner] All INIT steps finished successfully.")
         self.state     = "EXECUTING"
@@ -795,6 +917,24 @@ class ActionPlanner:
                 if d > 0:
                     return d
         return 0.0
+
+    def _update_arc_hinge(self, new_pivot: np.ndarray, curr_pos: np.ndarray) -> None:
+        """Apply a LoFTR pivot update: refresh arc_hinge XY, radius, current_angle.
+
+        Only XY is updated — with omega=[0,0,1] the PF pivot always has Z≈0,
+        while the hinge Z from initial edge detection is correct.
+        """
+        if np.linalg.norm(new_pivot[:2] - self.arc_hinge[:2]) < 0.005:
+            return  # < 5 mm change — not worth adjusting
+        diff  = curr_pos[:2] - new_pivot[:2]
+        new_r = float(np.linalg.norm(diff))
+        if not (0.05 < new_r < 1.0):
+            return  # outside plausible door-radius range
+        print(f"[Planner] arc_hinge XY {np.round(self.arc_hinge[:2], 3)} "
+              f"→ {np.round(new_pivot[:2], 3)}  r={new_r:.3f}m")
+        self.arc_hinge[:2]     = new_pivot[:2]
+        self.arc_radius        = new_r
+        self.arc_current_angle = np.arctan2(diff[1], diff[0])
 
     # ── private: per-step execution ────────────────────────────────────────
 
@@ -874,30 +1014,22 @@ class ActionPlanner:
                 start = self.grasp_pos if self.grasp_pos is not None else curr_pos
                 diff  = start[:2] - self.arc_hinge[:2]
                 self.arc_current_angle = np.arctan2(diff[1], diff[0])
-                self.arc_start_angle = self.arc_current_angle
-                
-                # Adaptive direction logic:
-                # We want a rotation direction that moves the handle in the 
-                # direction of the panel_normal (outward).
-                # tangent = z_axis x (handle - hinge)
-                # sign = sign(tangent · panel_normal)
-                radius_vec = start[:2] - self.arc_hinge[:2]
+                self.arc_radius = float(np.linalg.norm(diff)) or self.arc_radius
+                self.arc_swept  = 0.0
+
+                radius_vec  = diff
                 tangent_ccw = np.array([-radius_vec[1], radius_vec[0]])
                 dot = np.dot(tangent_ccw, self.panel_normal[:2])
-                
                 self.arc_direction = 1.0 if dot > 0 else -1.0
-                self.arc_target_angle  = self.arc_current_angle + self.arc_direction * PULL_ARC_ANGLE
-                self.arc_initialized   = True
-                
-                print(f"[Planner] Arc init: StartAngle={self.arc_current_angle:.2f}, "
-                      f"Dir={self.arc_direction}, Target={self.arc_target_angle:.2f}")
+                self.arc_initialized = True
 
-            # Advance arc angle
-            remaining_angle = self.arc_target_angle - self.arc_current_angle
-            if abs(remaining_angle) > ARC_STEP:
-                self.arc_current_angle += np.sign(remaining_angle) * ARC_STEP
-            else:
-                self.arc_current_angle = self.arc_target_angle
+                print(f"[Planner] Arc init: angle={np.rad2deg(self.arc_current_angle):.1f}°, "
+                      f"dir={self.arc_direction}, radius={self.arc_radius:.3f}m")
+
+            # Advance arc by one step
+            step = min(ARC_STEP, PULL_ARC_ANGLE - self.arc_swept)
+            self.arc_current_angle += self.arc_direction * step
+            self.arc_swept += step
 
             handle_z = (self.grasp_pos[2] if self.grasp_pos is not None
                         else curr_pos[2])
@@ -907,16 +1039,12 @@ class ActionPlanner:
                 handle_z,
             ])
 
-            # Smoothly rotate gripper orientation:
-            # delta_theta = current - start. Apply rotation around Z-axis to initial grasp orientation.
-            delta_theta = self.arc_current_angle - self.arc_start_angle
-            
-            # Initial orientation at grasp
-            r_grasp = wxyz_to_scipy(self.grasp_quat)
-            # Offset rotation around global Z
+            # Rotate gripper by the total swept angle around the global Z axis
+            delta_theta = self.arc_direction * self.arc_swept
+            r_grasp  = wxyz_to_scipy(self.grasp_quat)
             r_offset = R.from_rotvec([0, 0, delta_theta])
             arc_quat = scipy_to_wxyz(r_offset * r_grasp)
-            
+
             return arc_pos, arc_quat, GRIPPER_CLOSED
 
         # ── Release ───────────────────────────────────────────────────────
@@ -950,7 +1078,7 @@ class ActionPlanner:
             return pulled >= PULL_LINEAR_DIST - STAGE_POS_TOL
 
         elif stage == "Pull_Arc":
-            return abs(self.arc_target_angle - self.arc_current_angle) < np.deg2rad(1.5)
+            return PULL_ARC_ANGLE - self.arc_swept < np.deg2rad(1.5)
 
         elif stage == "Release":
             return (grip_err < STAGE_GRIP_TOL) or (self.stage_step_count > GRASP_TIMEOUT_STEPS)
@@ -968,18 +1096,29 @@ class ActionPlanner:
         elif stage in ("Pull_Linear", "Pull_Arc"):
             self.post_pull_pos = curr_pos.copy()
             self.pull_target = None   # reset for potential reuse
+            if stage == "Pull_Arc" and self._loftr_thread is not None:
+                self._loftr_thread.stop()
+                self._loftr_thread = None
 
 # ─────────────────────────── ZMQ server main loop ─────────────────────────────
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='VLM Action Server')
+    parser.add_argument('--use_api', type=lambda x: x.lower() != 'false',
+                        default=True, metavar='BOOL',
+                        help='Use real VLM API (default: true). Pass false to use hardcoded reply.')
+    args = parser.parse_args()
+
     context = zmq.Context()
     socket  = context.socket(zmq.REP)
     socket.bind(f"tcp://*:{ZMQ_PORT}")
     print(f"[Server] VLM Action Server listening on tcp://*:{ZMQ_PORT}")
     print(f"[Server] Detection endpoint: {DET_SERVER_URL}")
     print(f"[Server] User instruction: '{USER_INSTRUCTION}'")
+    print(f"[Server] use_api={args.use_api}")
 
-    planner = ActionPlanner(user_instruction=USER_INSTRUCTION)
+    planner = ActionPlanner(user_instruction=USER_INSTRUCTION, use_api=args.use_api)
 
     poller = zmq.Poller()
     poller.register(socket, zmq.POLLIN)
