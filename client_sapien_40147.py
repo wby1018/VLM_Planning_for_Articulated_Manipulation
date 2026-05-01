@@ -1,3 +1,6 @@
+import argparse
+import math
+import os
 import time
 import numpy as np
 import zmq
@@ -5,8 +8,13 @@ import zlib
 import pickle
 import threading
 import queue
+from datetime import datetime
 from scipy.spatial.transform import Rotation as R
 import fpsample
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 import sapien
 import sapien.render
@@ -55,6 +63,16 @@ def take_picture_once(cam):
     col_buf = cam.get_picture('Color')         # (H,W,4) float32 [0,1]
     return pos_buf, seg_buf, col_buf
 
+def set_robot_visibility(robot, visible: bool):
+    """通过控制 RenderBodyComponent 的 enable()/disable() 方法来切换机器人渲染状态。"""
+    for link in robot.get_links():
+        for comp in link.entity.get_components():
+            if isinstance(comp, sapien.render.RenderBodyComponent):
+                if visible:
+                    comp.enable()
+                else:
+                    comp.disable()
+
 def get_point_cloud_from_buffers(pos_buf, seg_buf, cam, cabinet_seg_ids, num_points=1280):
     """从已拍照的缓冲区提取柜子点云，返回 (1, num_points, 3)。"""
     M = cam.get_model_matrix()  # 4×4，相机→世界
@@ -95,6 +113,103 @@ def get_raw_rgb_depth_from_buffers(pos_buf, col_buf):
     rgb = (col_buf[:, :, :3] * 255).astype(np.uint8)
     depth = (-pos_buf[:, :, 2]).astype(np.float32)  # 取反得正值深度
     return rgb, depth
+
+# -----------------
+# 数据录制工具
+# -----------------
+
+def init_recorder(script_dir, cam, cam_width=640, cam_height=480):
+    """创建录制目录结构并写入 camera_info.txt，返回 recorder dict。"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(script_dir, f"record_{timestamp}")
+    rgb_dir   = os.path.join(out_dir, "rgb")
+    depth_dir = os.path.join(out_dir, "depth")
+    os.makedirs(rgb_dir,   exist_ok=True)
+    os.makedirs(depth_dir, exist_ok=True)
+
+    fovy_deg = float(np.rad2deg(cam.fovy))
+    fy = (cam_height / 2.0) / math.tan(math.radians(fovy_deg) / 2.0)
+    fx = fy  # 方形像素
+    cx, cy = cam_width / 2.0, cam_height / 2.0
+    with open(os.path.join(out_dir, "camera_info.txt"), "w") as f:
+        f.write(f"width: {cam_width}\n")
+        f.write(f"height: {cam_height}\n")
+        f.write(f"fov: {fovy_deg}\n")
+        f.write(f"fx: {fx}\n")
+        f.write(f"fy: {fy}\n")
+        f.write(f"cx: {cx}\n")
+        f.write(f"cy: {cy}\n")
+
+    pose_file = open(os.path.join(out_dir, "camera_pose.txt"), "w")
+    link_pose_file = open(os.path.join(out_dir, "link_poses.txt"), "w")
+    ee_pose_file = open(os.path.join(out_dir, "ee_pose.txt"), "w")
+    
+    print(f"[Recorder] 录制目录已创建: {out_dir}")
+    return {
+        'out_dir':    out_dir,
+        'rgb_dir':    rgb_dir,
+        'depth_dir':  depth_dir,
+        'pose_file':  pose_file,
+        'link_pose_file': link_pose_file,
+        'ee_pose_file': ee_pose_file,
+        'frame_id':   0,
+        'last_save_time': -1.0,
+    }
+
+def record_frame(recorder, rgb, depth, cam_pos, cam_mat, link_poses, ee_pose):
+    """
+    保存一帧数据：
+      rgb        : (H, W, 3) uint8
+      depth      : (H, W)    float32，相机坐标系 z 深度（米），0=无效
+      cam_pos    : np.array(3,) 世界坐标
+      cam_mat    : np.array(3,3) 旋转矩阵 (列=[x,y,z_backward])
+      link_poses : list of (name, sapien.Pose)
+      ee_pose    : sapien.Pose
+    """
+    frame_id = recorder['frame_id']
+
+    # RGB
+    rgb_path = os.path.join(recorder['rgb_dir'], f"rgb_{frame_id:06d}.png")
+    if cv2 is not None:
+        cv2.imwrite(rgb_path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    else:
+        from PIL import Image
+        Image.fromarray(rgb).save(rgb_path)
+
+    # Depth map — 直接保存相机坐标系 z 深度（H, W）float32
+    depth_path = os.path.join(recorder['depth_dir'], f"depth_{frame_id:06d}.npy")
+    np.save(depth_path, depth.astype(np.float32))
+
+    # Camera Pose（由 cam_mat, cam_pos 组成的 Optical Pose）
+    # SAPIEN/OpenGL (Right, Up, Backward) -> OpenCV (Right, Down, Forward)
+    # 通过将旋转矩阵的第二列(Up)和第三列(Backward)取反来实现
+    cam_mat_cv = cam_mat @ np.diag([1, -1, -1])
+    q = R.from_matrix(cam_mat_cv).as_quat() # xyzw
+    line = (f"{frame_id:06d} {cam_pos[0]} {cam_pos[1]} {cam_pos[2]} "
+            f"{q[0]} {q[1]} {q[2]} {q[3]}\n")
+    recorder['pose_file'].write(line)
+    recorder['pose_file'].flush()
+
+    # Link Poses
+    for name, pose in link_poses:
+        lp = pose.p
+        lq = pose.q
+        lxyzw = [lq[1], lq[2], lq[3], lq[0]]
+        link_line = (f"{frame_id:06d} {name} {lp[0]} {lp[1]} {lp[2]} "
+                     f"{lxyzw[0]} {lxyzw[1]} {lxyzw[2]} {lxyzw[3]}\n")
+        recorder['link_pose_file'].write(link_line)
+    recorder['link_pose_file'].flush()
+
+    # EE Pose
+    ep = ee_pose.p
+    eq = ee_pose.q
+    exyzw = [eq[1], eq[2], eq[3], eq[0]]
+    ee_line = (f"{frame_id:06d} {ep[0]} {ep[1]} {ep[2]} "
+               f"{exyzw[0]} {exyzw[1]} {exyzw[2]} {exyzw[3]}\n")
+    recorder['ee_pose_file'].write(ee_line)
+    recorder['ee_pose_file'].flush()
+
+    recorder['frame_id'] += 1
 
 def get_camera_params(cam):
     """
@@ -234,6 +349,15 @@ class ZMQCommunicationThread(threading.Thread):
 # 主循环
 # -----------------
 def main():
+    parser = argparse.ArgumentParser(description='SAPIEN cabinet client')
+    parser.add_argument('--record_data', action='store_true',
+                        help='以 10Hz 保存 RGB/Depth/Pose 到同目录 record_* 文件夹', default=False)
+    parser.add_argument('--arm_visible', type=str, default='true',
+                        help='机械臂在深度图中是否可见 (true/false)。如果为 false，深度图将显示机械臂背后的背景。')
+    args = parser.parse_args()
+    
+    arm_visible = args.arm_visible.lower() == 'true'
+
     # 初始化通讯线程
     comm_thread = ZMQCommunicationThread("tcp://localhost:5555")
     comm_thread.start()
@@ -315,6 +439,11 @@ def main():
     cam = scene.add_camera('rgbd_camera', 640, 480, np.deg2rad(60), 0.01, 10.0)
     cam_eye, cam_target = np.array([-1.14, -0.09, 1.2]), np.array([1.367079, 0.197510, 0.82])
     cam.entity.set_pose(sapien_look_at(cam_eye, cam_target))
+
+    # 录制器初始化
+    recorder = None
+    if args.record_data:
+        recorder = init_recorder(base_dir, cam, cam_width=640, cam_height=480)
 
     viewer = None
     try:
@@ -418,15 +547,51 @@ def main():
 
             # --- 3. 观测采集与异步发送任务推送 ---
             if comm_thread.obs_queue.empty():
-                scene.update_render()
-                pos_buf, seg_buf, col_buf = take_picture_once(cam)
+                if arm_visible:
+                    # 正常单次采样
+                    scene.update_render()
+                    pos_buf, seg_buf, col_buf = take_picture_once(cam)
+                else:
+                    # 双重采样：RGB 带机械臂，Depth 不带机械臂
+                    # 1. 采样 RGB (带机械臂)
+                    scene.update_render()
+                    cam.take_picture()
+                    col_buf = cam.get_picture('Color')
+                    
+                    # 2. 隐藏机械臂并采样 Depth/Position
+                    set_robot_visibility(panda, False)
+                    scene.update_render()
+                    cam.take_picture()
+                    pos_buf = cam.get_picture('Position')
+                    seg_buf = cam.get_picture('Segmentation')
+                    
+                    # 3. 恢复机械臂状态 (为了 Viewer 和下一帧)
+                    set_robot_visibility(panda, True)
+                    # 此处不需要立即 update_render，由 viewer.render() 处理
                 
                 cur_pc = get_point_cloud_from_buffers(pos_buf, seg_buf, cam, cabinet_seg_ids)
                 cur_gp = get_gripper_pcd(hand_link, lf_link, rf_link)
                 cur_ap = get_agent_pos(hand_link, panda)
                 cur_rgb, cur_depth = get_raw_rgb_depth_from_buffers(pos_buf, col_buf)
                 cam_pos, cam_mat, fovy = get_camera_params(cam)
-                
+
+                # --- 录制：10Hz ---
+                if recorder is not None:
+                    now = time.perf_counter()
+                    if now - recorder['last_save_time'] >= 0.1:  # 10Hz
+                        recorder['last_save_time'] = now
+                        
+                        # 收集所有 Link 的位姿
+                        link_poses = []
+                        for link in panda.get_links():
+                            link_poses.append((link.name, link.entity.get_pose()))
+                        
+                        # EE 位姿
+                        ee_pose = hand_link.entity.get_pose()
+                        
+                        # 使用已经算好的 cam_pos, cam_mat 进行录制 (光学坐标系位姿)
+                        record_frame(recorder, cur_rgb, cur_depth, cam_pos, cam_mat, link_poses, ee_pose)
+
                 obs_history['pc'].append(cur_pc); obs_history['gp'].append(cur_gp); obs_history['ap'].append(cur_ap)
                 if len(obs_history['pc']) > 2:
                     for k in obs_history: obs_history[k].pop(0)
@@ -455,6 +620,11 @@ def main():
     except KeyboardInterrupt: print("\n用户中断。")
     finally:
         comm_thread.running = False
+        if recorder is not None:
+            recorder['pose_file'].close()
+            recorder['link_pose_file'].close()
+            recorder['ee_pose_file'].close()
+            print(f"[Recorder] 录制完成，共 {recorder['frame_id']} 帧，保存至: {recorder['out_dir']}")
         if viewer is not None:
             try: viewer.close()
             except: pass
