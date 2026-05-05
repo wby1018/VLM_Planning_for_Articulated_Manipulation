@@ -45,9 +45,9 @@ SIGMA_KIN      = 0.003   # 夹爪 3D 重投影误差标准差 (m)
 SIGMA_RAD      = 0.001  # 半径一致性误差标准差 (m)，强约束
 SIGMA_VIS      = 0.001  # 视觉点云误差标准差 (m) (原 0.01，调小以增加权重)
 PROC_NOISE_W   = 1e-8   # 极小值，锁定转轴方向 (几乎不动)
-PROC_NOISE_V   = 1e-5   # 较大值，允许转轴位置快速平移收敛 (快速变)
-PROC_NOISE_T   = 5e-3   # theta 噪声
-ESS_RATIO      = 0.9    # 有效粒子数比例阈值，低于此重采样
+PROC_NOISE_V   = 2e-5   # 较大值，允许转轴位置快速平移收敛 (快速变)
+PROC_NOISE_T   = 5e-4   # theta 噪声
+ESS_RATIO      = 0.5    # 有效粒子数比例阈值，低于此重采样
 
 # =============================================================================
 # 数据加载
@@ -597,7 +597,7 @@ class Visualizer:
             title = f'Frame {frame_id}\nInit avg_disp={init_disp_cm:.1f}cm  matches={n_matches}'
         else:
             sp_str = f'  σp={sigma_p*100:.1f}cm' if sigma_p is not None else ''
-            title = f'Frame {frame_id}\nθ={np.rad2deg(theta):.1f}°  matches={n_matches}{sp_str}'
+            # title = f'Frame {frame_id}\nθ={np.rad2deg(theta):.1f}°  matches={n_matches}{sp_str}'
         ax.set_title(title)
         if pivot is not None:
             ax.legend(fontsize=7, loc='upper left')
@@ -758,7 +758,7 @@ class LoFTRAxisEstimator:
         )
 
         if src_w is None:
-            print(f"[Frame {frame_id}] LoFTR 动态匹配点不足, 跳过")
+            # print(f"[Frame {frame_id}] LoFTR 动态匹配点不足, 跳过")
             self._advance(curr_depth, curr_rgb_bgr, c2w, frame_id)
             return None
 
