@@ -56,24 +56,26 @@ from openai import OpenAI
 from scipy.spatial import KDTree
 from scipy.spatial.transform import Rotation as R
 
-from loftr_pf import LoFTRAxisEstimator
+from loftr_fg import LoFTRAxisEstimatorFG
 
 # ─────────────────────────── Configuration ────────────────────────────────────
 
 ZMQ_PORT         = 5555
 DET_SERVER_URL   = "http://127.0.0.1:8000/detect"
-DET_QUERIES      = ["handle", "drawer", "cabinet door"]
+DET_QUERIES      = ["handle"]
 
 VLM_MODEL        = "gpt-5.4"   # model name used by the Responses API
-DET_THRESHOLD    = 0.2
+DET_THRESHOLD    = 0.1
 
 USE_VISUALIZER   = True
 
-USER_INSTRUCTION = "open the cabinet door"
+# USER_INSTRUCTION = "open the cabinet door"
+USER_INSTRUCTION = "open the second bottom drawer"
 
 # Motion tuning
-APPROACH_DIST   = 0.19   # m — standoff before grasping
-STAGE_POS_TOL   = 0.02   # m — position tolerance to mark stage done (tightened from 0.038)
+APPROACH_DIST   = 0.10   # m — standoff before grasping
+STAGE_POS_TOL   = 0.03   # m — position tolerance for Grasp / ProbePull / Pull_* stages
+APPROACH_POS_TOL = 0.05  # m — position tolerance for MoveTo / Approach (looser)
 STAGE_ANG_TOL   = 0.08   # rad
 STAGE_GRIP_TOL  = 0.004  # m gripper width
 GRASP_TIMEOUT_STEPS = 15 # steps (approx 1.5s) to wait for gripper
@@ -83,15 +85,15 @@ MAX_DELTA_ANG   = np.deg2rad(2.5)
 GRIPPER_DELTA   = 0.003  # m per step
 GRIPPER_OPEN    = 0.04
 GRIPPER_CLOSED  = 0.000
-GRASP_OFFSET    = 0.07  # m — distance from Panda 'hand' frame to finger tips
+GRASP_OFFSET    = 0.08  # m — distance from Panda 'hand' frame to finger tips
 GRASP_DEPTH_OFFSET = 0.015  # m — pull back the target pose to avoid hitting the door
-TARGET_Z_OFFSET = 0.01   # m — upward shift of the target grasp point
+TARGET_Z_OFFSET = 0.00   # m — upward shift of the target grasp point
 NORMAL_SCAN_RADIUS = 0.15 # m — radius around handle to sample panel points
 
 PULL_LINEAR_DIST = 0.38  # m total drawer pull
 PULL_STEP        = 0.005  # m per step increment
-PULL_ARC_ANGLE   = np.deg2rad(90)  # total door sweep
-ARC_STEP         = np.deg2rad(0.3)  # rad per step
+PULL_ARC_ANGLE   = np.deg2rad(80)  # total door sweep
+ARC_STEP         = np.deg2rad(0.4)  # rad per step
 
 # ProbePull / TypeCheck
 PROBE_DISTANCE       = 0.05   # m — small pull for type identification
@@ -428,7 +430,10 @@ def type_check(P0: np.ndarray, P1: np.ndarray,
     }
 
     if len(P0) < MIN_PROBE_PCD_POINTS or len(P1) < MIN_PROBE_PCD_POINTS:
-        print(f"[TypeCheck] Insufficient points: P0={len(P0)}, P1={len(P1)} — returning Unknown")
+        print(f"[TypeCheck] Insufficient points: P0={len(P0)}, P1={len(P1)} "
+              f"— forcing Rotation fallback (5-class forced decision)")
+        result["motion_type"] = "Rotation"
+        result["confidence"]  = 0.3
         return result
 
     dg = g1 - g0  # actual gripper displacement
@@ -481,31 +486,35 @@ def type_check(P0: np.ndarray, P1: np.ndarray,
         result["theta_axis"]      = best_axis_rec["theta"]
         result["axis_fit_error"]  = best_axis_rec["fit_error"]
 
-    # ── Decision ─────────────────────────────────────────────────────────────
+    # ── Forced 5-class decision (no Unknown) ────────────────────────────────
+    # Always pick the winner: Translation vs best Rotation.
     E_T_ok = not (np.isnan(E_T) or np.isinf(E_T))
-    E_R_ok = not (np.isnan(best_E_rot) or np.isinf(best_E_rot)) and best_axis_rec is not None
+    E_R_ok = (not (np.isnan(best_E_rot) or np.isinf(best_E_rot))
+              and best_axis_rec is not None)
 
     if E_T_ok and E_R_ok:
         denom = E_T + best_E_rot + 1e-8
-        if E_T + TYPECHECK_MARGIN < best_E_rot:
+        if E_T <= best_E_rot:
             result["motion_type"] = "Translation"
             result["confidence"]  = (best_E_rot - E_T) / denom
-        elif best_E_rot + TYPECHECK_MARGIN < E_T:
-            if abs(best_axis_rec["theta"]) < np.deg2rad(2.0):
-                result["motion_type"] = "Unknown"
-                result["confidence"]  = 0.1
-            else:
-                result["motion_type"] = "Rotation"
-                result["confidence"]  = (E_T - best_E_rot) / denom
-        # else: stays Unknown
+        else:
+            result["motion_type"] = "Rotation"
+            result["confidence"]  = (E_T - best_E_rot) / denom
     elif E_T_ok:
+        # Only Translation hypothesis valid
         result["motion_type"] = "Translation"
         result["confidence"]  = 0.5
     elif E_R_ok:
+        # Only Rotation hypothesis valid
         result["motion_type"] = "Rotation"
         result["confidence"]  = 0.5
+    else:
+        # Both failed (no PCD, no valid axes) — force Rotation as safer fallback
+        print("[TypeCheck] All hypotheses invalid — forcing Rotation (5-class fallback)")
+        result["motion_type"] = "Rotation"
+        result["confidence"]  = 0.2
 
-    print(f"[TypeCheck] Decision: {result['motion_type']} "
+    print(f"[TypeCheck] Forced decision: {result['motion_type']} "
           f"(conf={result['confidence']:.3f}, E_T={E_T:.5f}, E_R={best_E_rot:.5f})")
     return result
 
@@ -821,16 +830,13 @@ VLM_SYSTEM_PROMPT = """\
 **Role**: You are a high-level Robotic Task Planner for articulated object manipulation.
 
 **Task**:
-Analyze the input image containing ID-labeled bounding boxes. Based on the user's natural
-language instruction, generate a structured JSON plan to operate drawers or cabinet doors.
+Analyze the input image containing ID-labeled bounding boxes of handles.
+Based on the user's natural language instruction, select the correct handle and
+determine the motion type.
 
-**Object Categories & Logic**:
-1. **Drawer**: A sliding object.
-   - `motion_type`: `Translation`
-   - `valid_action`: `Pull_Linear`
-2. **Cabinet Door**: A hinged swinging object.
-   - `motion_type`: `Rotation`
-   - `valid_action`: `Pull_Arc`
+**Motion Type Logic**:
+- `Translation`: The object slides (drawer). Action = `Pull_Linear`.
+- `Rotation`: The object swings on a hinge (cabinet door). Action = `Pull_Arc`.
 
 **Gripper Orientation Logic**:
 - `Vertical`: Select if the handle's width is significantly greater than its height.
@@ -840,11 +846,11 @@ language instruction, generate a structured JSON plan to operate drawers or cabi
 1. **Valid Stages**: ONLY use these: ["MoveTo", "Grasp", "Pull_Linear", "Pull_Arc", "Release"]
    (The server will auto-insert Approach, ProbePull, TypeCheck — do NOT include them.)
 2. **Output Format**: Return ONLY a valid JSON object. No preamble, no post-analysis.
+3. Do NOT include `parent_object_id` — it is not needed.
 
 **JSON Schema**:
 {
   "target_handle_id": int,
-  "parent_object_id": int,
   "motion_type": "Translation" | "Rotation",
   "gripper_orientation": "Horizontal" | "Vertical",
   "plan": ["Stage_1", "Stage_2", ...]
@@ -913,7 +919,7 @@ def call_vlm(annotated_bgr: np.ndarray, user_instruction: str,
     #     'plan': ['MoveTo', 'Grasp', 'Pull_Linear', 'Release']
     # }
     return {
-        'target_handle_id': 3, 'parent_object_id': 2,
+        'target_handle_id': 1,
         'motion_type': 'Rotation', 'gripper_orientation': 'Horizontal',
         'plan': ['MoveTo', 'Grasp', 'Pull_Arc', 'Release']
     }
@@ -923,16 +929,16 @@ def call_vlm(annotated_bgr: np.ndarray, user_instruction: str,
 
 class LoFTREstimatorThread:
     """
-    Background thread that continuously refines the rotation axis using LoFTR-PF.
+    Background thread that continuously refines the rotation axis using LoFTR-FG.
 
     Started only after TypeCheck determines Rotation.
     Frames are pushed via push(); the latest axis estimate is readable via
-    get_axis() at any time.  Drops frames when the particle filter is slower
+    get_axis() at any time.  Drops frames when the factor graph solver is slower
     than the control loop so the queue never grows unbounded.
     """
 
     def __init__(self, K: np.ndarray, omega0: np.ndarray, p0: np.ndarray):
-        self._estimator = LoFTRAxisEstimator(K, omega0, p0, theta0=0.0, visualize=False)
+        self._estimator = LoFTRAxisEstimatorFG(K, omega0, p0, theta0=0.0, visualize=False)
         self._queue: queue.Queue = queue.Queue(maxsize=2)
         self._lock = threading.Lock()
         self._pivot    = np.array(p0,     dtype=np.float64).copy()
@@ -1239,18 +1245,16 @@ class ActionPlanner:
         print(f"[Planner] [Step 4/7] handle_3d = {np.round(self.handle_3d, 3)}")
 
         # ── 5. Panel normal ────────────────────────────────────────────────
-        print("[Planner] [Step 5/7] Estimating panel normal...")
-        parent_det = next(
-            (d for d in self.detections if d["index"] == plan.get("parent_object_id")), None
-        )
-        parent_mask = (decode_mask(parent_det["mask"], H, W)
-                       if (parent_det and "mask" in parent_det) else None)
-        self.parent_mask = parent_mask
+        # Detection only captures handles now (no parent/door mask available).
+        # Panel normal is estimated purely from depth around the handle.
+        print("[Planner] [Step 5/7] Estimating panel normal (handle-only, no parent mask)...")
+        parent_mask = None
+        self.parent_mask = None
 
         self.panel_normal, self.normal_pts = estimate_panel_normal(
             depth, handle_det["box"], self.handle_3d,
             cam_pos, cam_mat, fovy,
-            parent_mask=parent_mask
+            parent_mask=None
         )
         print(f"[Planner] Final normal = {np.round(self.panel_normal, 3)}")
 
@@ -1265,21 +1269,15 @@ class ActionPlanner:
         self.grasp_target_pos = self.handle_3d - GRASP_OFFSET * approach_dir
         self.approach_pos     = self.grasp_target_pos + self.panel_normal * APPROACH_DIST
 
-        # ── 7. Arc fallback parameters (hinged door only) ──────────────────
+        # ── 7. Arc fallback default (hinge from parent mask removed) ──────
         if plan["motion_type"] == "Rotation":
-            print("[Planner] [Step 7/7] Estimating initial hinge (fallback for TypeCheck Unknown)...")
-            if parent_mask is not None:
-                self.arc_hinge, self.arc_radius, self.hinge_edge_pts = estimate_hinge_params(
-                    depth, parent_mask, handle_det["box"],
-                    cam_pos, cam_mat, fovy
-                )
-            else:
-                print("[Planner] [WARN] No parent mask for hinge estimation!")
-                self.arc_hinge = np.array([0., 0., 0.], dtype=np.float64)
-                self.arc_radius = 0.3
-
-            # NOTE: LoFTR thread is NOT started here.
-            # It is deferred to _on_complete("TypeCheck") if TypeCheck → Rotation.
+            # No parent mask available — hinge will be determined by TypeCheck
+            # and refined online by LoFTR-FG.  Set a zero-placeholder here;
+            # _on_complete("TypeCheck") will overwrite it.
+            print("[Planner] [Step 7/7] Rotation plan detected. "
+                  "Hinge will be set by TypeCheck / LoFTR-FG (no mask-based estimation).")
+            self.arc_hinge  = np.zeros(3, dtype=np.float64)
+            self.arc_radius = 0.3
         else:
             print("[Planner] [Step 7/7] Translation plan — no hinge estimation needed.")
 
@@ -1339,12 +1337,17 @@ class ActionPlanner:
 
         if (P0 is None or P1 is None or g0 is None or g1 is None
                 or len(P0) == 0 or len(P1) == 0):
-            print("[TypeCheck] Missing probe data — falling back to Unknown")
+            print("[TypeCheck] Missing probe PCD data — forcing Rotation (5-class forced decision)")
             self.typecheck_result = {
-                "motion_type": "Unknown", "confidence": 0.0,
-                "E_translation": float("nan"), "E_rotation": float("nan"),
-                "best_axis_side": None, "best_axis_point": None,
-                "best_axis_dir": None, "theta_axis": 0.0, "axis_fit_error": float("nan"),
+                "motion_type":    "Rotation",
+                "confidence":     0.2,
+                "E_translation":  float("nan"),
+                "E_rotation":     float("nan"),
+                "best_axis_side": None,
+                "best_axis_point": None,
+                "best_axis_dir":  None,
+                "theta_axis":     0.0,
+                "axis_fit_error": float("nan"),
             }
             return
 
@@ -1439,14 +1442,14 @@ class ActionPlanner:
 
         # ── Pull_Arc ──────────────────────────────────────────────────────
         elif stage == "Pull_Arc":
-            # Resolve axis: prefer TypeCheck/LoFTR result, fallback to legacy arc_hinge + Z
-            if self.arc_axis_point is not None and self.arc_axis_dir is not None:
-                axis_point = self.arc_axis_point
-                axis_dir   = self.arc_axis_dir
-            else:
-                axis_point = (self.arc_hinge if self.arc_hinge is not None
-                              else np.zeros(3, dtype=np.float64))
-                axis_dir   = np.array([0.0, 0.0, 1.0])
+            # Axis must be set by TypeCheck before Pull_Arc runs
+            if self.arc_axis_point is None or self.arc_axis_dir is None:
+                print(f"[Planner] WARNING: Pull_Arc called but arc_axis not yet set "
+                      "(TypeCheck may be Unknown). Holding position.")
+                q = self.grasp_quat if self.grasp_quat is not None else self.approach_quat
+                return curr_pos.copy(), q, GRIPPER_CLOSED
+            axis_point = self.arc_axis_point
+            axis_dir   = self.arc_axis_dir
 
             # 0° reference pose: gripper position/orientation at START of ProbePull (= end of Grasp)
             # arc_ref_pos is saved in _on_complete('Grasp') and is NEVER overwritten by ProbePull.
@@ -1539,7 +1542,7 @@ class ActionPlanner:
                         pos_err: float, ang_err: float, grip_err: float,
                         curr_pos: np.ndarray) -> bool:
         if stage in ("MoveTo", "Approach"):
-            return (pos_err < STAGE_POS_TOL) and (ang_err < STAGE_ANG_TOL)
+            return (pos_err < APPROACH_POS_TOL) and (ang_err < STAGE_ANG_TOL)
 
         elif stage == "Grasp":
             return (grip_err < STAGE_GRIP_TOL) or (self.stage_step_count > GRASP_TIMEOUT_STEPS)
@@ -1580,7 +1583,7 @@ class ActionPlanner:
             self.arc_ref_quat = scipy_to_wxyz(R.from_matrix(curr_rot))
             print(f"[Planner] Grasp recorded at {np.round(self.grasp_pos, 3)}")
 
-            # Save probe start observations
+            # Save probe START observations (depth+pose only; PCD built after ProbePull)
             self.probe_start_gripper_pos = curr_pos.copy()
             if self._curr_depth is not None:
                 self.probe_start_depth    = self._curr_depth.copy()
@@ -1588,15 +1591,9 @@ class ActionPlanner:
                 self.probe_start_cam_pose = (self._curr_cam_pos.copy(),
                                              self._curr_cam_mat.copy(),
                                              self._curr_fovy)
-                if self.parent_mask is not None:
-                    self.probe_start_object_pcd = backproject_mask_to_pcd(
-                        self.probe_start_depth, self.parent_mask,
-                        self._curr_cam_pos, self._curr_cam_mat, self._curr_fovy
-                    )
-                    print(f"[Planner] Probe start PCD: {len(self.probe_start_object_pcd)} pts")
 
         elif stage == "ProbePull":
-            # Save probe end observations
+            # Save probe END observations
             self.probe_end_gripper_pos = curr_pos.copy()
             if self._curr_depth is not None:
                 self.probe_end_depth    = self._curr_depth.copy()
@@ -1604,13 +1601,34 @@ class ActionPlanner:
                 self.probe_end_cam_pose = (self._curr_cam_pos.copy(),
                                            self._curr_cam_mat.copy(),
                                            self._curr_fovy)
-                if self.parent_mask is not None:
-                    # Method A: reuse probe_start parent_mask for speed
-                    self.probe_end_object_pcd = backproject_mask_to_pcd(
-                        self.probe_end_depth, self.parent_mask,
-                        self._curr_cam_pos, self._curr_cam_mat, self._curr_fovy
+
+            # Build dynamic point clouds from depth difference (no mask needed).
+            # Dynamic pixels = those where depth changed significantly during ProbePull.
+            if (self.probe_start_depth is not None
+                    and self.probe_end_depth is not None
+                    and self.probe_start_cam_pose is not None
+                    and self.probe_end_cam_pose is not None):
+                d0 = self.probe_start_depth
+                d1 = self.probe_end_depth
+                dyn_mask = (np.abs(d0.astype(np.float32) - d1.astype(np.float32)) > 0.001)
+                dyn_mask &= (d0 > 0) & (d1 > 0)
+                n_dyn = int(np.sum(dyn_mask))
+                print(f"[Planner] ProbePull dynamic mask: {n_dyn} px")
+                if n_dyn >= 10:
+                    pos0, mat0, fov0 = self.probe_start_cam_pose
+                    pos1, mat1, fov1 = self.probe_end_cam_pose
+                    self.probe_start_object_pcd = backproject_mask_to_pcd(
+                        d0, dyn_mask, pos0, mat0, fov0
                     )
-                    print(f"[Planner] Probe end PCD: {len(self.probe_end_object_pcd)} pts")
+                    self.probe_end_object_pcd = backproject_mask_to_pcd(
+                        d1, dyn_mask, pos1, mat1, fov1
+                    )
+                    print(f"[Planner] Probe dynamic PCD: "
+                          f"P0={len(self.probe_start_object_pcd)} pts, "
+                          f"P1={len(self.probe_end_object_pcd)} pts")
+                else:
+                    print("[Planner] WARNING: ProbePull dynamic mask too small — "
+                          "TypeCheck will use forced Rotation fallback")
 
             # Update grasp reference to current position so Pull_* starts from here
             self.grasp_pos  = curr_pos.copy()
@@ -1679,14 +1697,8 @@ class ActionPlanner:
                       f"θ={np.rad2deg(self.arc_probe_theta):.1f}°, "
                       f"Stages: {self.stages}")
 
-            else:  # Unknown — keep VLM initial plan
-                print("[Planner] TypeCheck → Unknown. Keeping VLM initial plan.")
-                # If VLM plan included Pull_Arc and we have a hinge estimate, use it
-                if "Pull_Arc" in self.stages[self.stage_idx + 1:]:
-                    if self.arc_hinge is not None:
-                        self.arc_axis_point = self.arc_hinge.copy()
-                        self.arc_axis_dir   = np.array([0.0, 0.0, 1.0])
-                        print("[Planner] Fallback: using initial hinge + Z axis for Pull_Arc")
+            else:
+                print(f"[Planner] TypeCheck returned unexpected motion_type: {motion_type}")
 
         elif stage in ("Pull_Linear", "Pull_Arc"):
             self.post_pull_pos = curr_pos.copy()

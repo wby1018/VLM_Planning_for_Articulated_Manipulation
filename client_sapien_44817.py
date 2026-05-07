@@ -312,7 +312,7 @@ def main():
 
     panda_urdf = os.path.join(base_dir, "panda", "panda_v2.urdf")
     panda = loader.load(panda_urdf)
-    panda.set_pose(sapien.Pose(p=[0.2, 0.6, 0.0]))
+    panda.set_pose(sapien.Pose(p=[0.3, 0.6, 0.0]))
 
     panda_links = panda.get_links()
     hand_link = next(l for l in panda_links if l.name == 'panda_hand')
