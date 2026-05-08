@@ -42,6 +42,20 @@ source "${CONDA_SH}"
 conda activate "${ENV_NAME}" || { echo "❌ 无法激活 conda env '${ENV_NAME}'"; exit 1; }
 echo "✅ 已激活 conda env: ${ENV_NAME}  (python: $(python -V 2>&1))"
 
+# Source the OpenAI key file if present (for action_server VLM call_vlm + the
+# sidecar's Phase D update_joint_vlm). nohup'd / non-interactive shells skip
+# ~/.bashrc's source line, so we do it explicitly here.
+if [[ -f "${HOME}/.openai_env" ]]; then
+  # shellcheck disable=SC1091
+  source "${HOME}/.openai_env"
+  if [[ -n "${OPENAI_API_KEY:-}" ]]; then
+    echo "✅ OPENAI_API_KEY loaded (length=${#OPENAI_API_KEY}, prefix=${OPENAI_API_KEY:0:7}…)"
+  fi
+else
+  echo "⚠️  ~/.openai_env not found — VLM (action_server.call_vlm) and Phase D"
+  echo "   (sidecar.update_joint_vlm) will both fall back to defaults."
+fi
+
 cd "${REPO_DIR}"
 
 # ── 端口占用预检查 ──────────────────────────────────────────────

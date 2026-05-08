@@ -25,11 +25,19 @@ import sapien.render
 # Reconstruction sidecar (Option 2 — Sidecar). Sends RGB-D frames to a
 # separate FastAPI server; does NOT affect ActionPlanner decisions.
 RECON_URL = "http://localhost:8002"
-RECON_SEND_INTERVAL = 100   # was 200, briefly tried 30. Sweet spot: small
-                            # enough that Pull_Arc (~1.5k sim steps) yields
-                            # ~10-15 ingested frames covering 0–90° pose
-                            # spread, large enough that SAM3 video re-run
-                            # (O(N²) per call) doesn't bottleneck the loop.
+RECON_SEND_INTERVAL_S = 1.5  # wall-time seconds between sidecar /ingest_frame
+                             # calls. Wall-time-based — the previous sim-step
+                             # counter only advanced inside the obs-collection
+                             # branch, so it lagged real time and only gave
+                             # ~3 ingests per task. 1.5 s wall time × ~10 s
+                             # task duration = ~6-7 frames covering the full
+                             # joint motion — good pose diversity for Phase C.
+RECON_MAX_INGEST = 8         # cap total ingests per task — SAM3 video session
+                             # re-cost is O(N²) per ingest; past ~10 frames
+                             # each ingest takes seconds and stalls the
+                             # async-ingest worker queue. Phase C reliably
+                             # converges with 5-8 well-spaced frames anyway
+                             # (see test_e2e_door's 3-frame fits at conf=1.0).
 
 # -----------------
 # 数学工具
@@ -534,8 +542,7 @@ def main():
     recon_initialized = False
     recon_state_dir = None
     recon_frame_idx = 0
-    last_recon_send_step = 0
-    sim_step_count = 0
+    last_recon_send_wall_time = 0.0  # seconds, w.r.t. start_wall_time
 
     try:
         while True:
@@ -663,8 +670,7 @@ def main():
                 }
                 comm_thread.obs_queue.put(obs_msg)
 
-                # === Reconstruction sidecar (Option 2): init on first frame, ingest periodically ===
-                sim_step_count += 1
+                # === Reconstruction sidecar: init on first frame, ingest periodically (wall-time based) ===
                 if not recon_initialized:
                     recon_state_dir = tempfile.mkdtemp(prefix="recon_state_40147_")
                     H, W = cur_rgb.shape[:2]
@@ -687,28 +693,46 @@ def main():
                     except Exception as e:
                         print(f"[recon] init error (non-fatal): {e}")
 
-                if recon_initialized and sim_step_count - last_recon_send_step >= RECON_SEND_INTERVAL:
+                if (recon_initialized
+                        and recon_frame_idx < RECON_MAX_INGEST
+                        and (current_wall_time - last_recon_send_wall_time) >= RECON_SEND_INTERVAL_S):
                     # build c2w (4,4) from cam_pos / cam_mat (3,3)
                     c2w = np.eye(4)
                     c2w[:3, :3] = cam_mat
                     c2w[:3,  3] = cam_pos
-                    try:
-                        resp = requests.post(f"{RECON_URL}/ingest_frame", data=pickle.dumps({
-                            'frame_idx': recon_frame_idx,
-                            'label':     f"f{recon_frame_idx:03d}",
-                            'rgb':       cur_rgb.astype(np.uint8),
-                            'depth_m':   cur_depth.astype(np.float32),
-                            'c2w':       c2w.astype(np.float64),
-                            'cam_pos_world': cam_pos.astype(np.float64),
-                        }), timeout=180)
-                        if resp.json().get('ok'):
-                            print(f"[recon] frame {recon_frame_idx} ingested")
-                            recon_frame_idx += 1
-                        else:
-                            print(f"[recon] ingest failed: {resp.text[:300]}")
-                    except Exception as e:
-                        print(f"[recon] ingest error (non-fatal): {e}")
-                    last_recon_send_step = sim_step_count
+                    # Fire-and-forget HTTP POST in a daemon thread — sidecar's
+                    # SAM3 video session is O(N²) per frame and serialised on
+                    # its main thread; a synchronous post here would block the
+                    # SAPIEN main loop for seconds, stalling ZMQ obs delivery
+                    # and starving ActionPlanner of state updates. Snapshot
+                    # the data into the closure (numpy arrays are sliced/cast
+                    # to fresh memory) so subsequent mutations of cur_rgb /
+                    # cur_depth don't race with the inflight POST.
+                    _payload = pickle.dumps({
+                        'frame_idx':     recon_frame_idx,
+                        'label':         f"f{recon_frame_idx:03d}",
+                        'rgb':           cur_rgb.astype(np.uint8).copy(),
+                        'depth_m':       cur_depth.astype(np.float32).copy(),
+                        'c2w':           c2w.astype(np.float64),
+                        'cam_pos_world': cam_pos.astype(np.float64).copy(),
+                    })
+                    _frame_id = recon_frame_idx
+                    def _async_ingest(payload, frame_id):
+                        try:
+                            resp = requests.post(f"{RECON_URL}/ingest_frame",
+                                                 data=payload, timeout=180)
+                            j = resp.json()
+                            if j.get('ok'):
+                                print(f"[recon] frame {frame_id} ingested (async)")
+                            else:
+                                print(f"[recon] frame {frame_id} ingest failed: {resp.text[:200]}")
+                        except Exception as e:
+                            print(f"[recon] frame {frame_id} ingest error (non-fatal): {e}")
+                    threading.Thread(target=_async_ingest,
+                                     args=(_payload, _frame_id),
+                                     daemon=True).start()
+                    recon_frame_idx += 1
+                    last_recon_send_wall_time = current_wall_time
                 # === end reconstruction sidecar ===
 
             # --- 4. 渲染 ---
