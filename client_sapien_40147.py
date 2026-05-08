@@ -25,19 +25,19 @@ import sapien.render
 # Reconstruction sidecar (Option 2 — Sidecar). Sends RGB-D frames to a
 # separate FastAPI server; does NOT affect ActionPlanner decisions.
 RECON_URL = "http://localhost:8002"
-RECON_SEND_INTERVAL_S = 1.5  # wall-time seconds between sidecar /ingest_frame
-                             # calls. Wall-time-based — the previous sim-step
-                             # counter only advanced inside the obs-collection
-                             # branch, so it lagged real time and only gave
-                             # ~3 ingests per task. 1.5 s wall time × ~10 s
-                             # task duration = ~6-7 frames covering the full
-                             # joint motion — good pose diversity for Phase C.
-RECON_MAX_INGEST = 8         # cap total ingests per task — SAM3 video session
-                             # re-cost is O(N²) per ingest; past ~10 frames
-                             # each ingest takes seconds and stalls the
-                             # async-ingest worker queue. Phase C reliably
-                             # converges with 5-8 well-spaced frames anyway
-                             # (see test_e2e_door's 3-frame fits at conf=1.0).
+RECON_SEND_INTERVAL_S = 2.0  # wall-time seconds between sidecar /ingest_frame
+                             # calls. Widened from 1.5 → 2.0 so the 15-frame
+                             # capture window (15×2=30s) covers the full task
+                             # wall-clock duration (~14s) instead of ending
+                             # mid-Pull_Linear.
+RECON_MAX_INGEST = 15        # cap total ingests per task. Bumped from 8 → 15
+                             # because 8 frames at 1.5s only covered through
+                             # Pull_Linear's first half — drawer was barely
+                             # moving in early frames so Phase C signal was
+                             # noise-dominated. Safe with GT-mask shim
+                             # (compute_masks_through_latest is O(1)); if you
+                             # disable the shim and use real SAM3, drop back
+                             # to ~10 because video session re-cost is O(N²).
 
 # -----------------
 # 数学工具

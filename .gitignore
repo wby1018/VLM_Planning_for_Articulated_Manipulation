@@ -11,3 +11,10 @@ co-tracker/
 anygrasp_sdk/
 GAMMA-ICRA2024/
 Pointnet2_PyTorch/
+# Sidecar runtime + per-task experiment archives
+logs/
+logs.before_pull/
+recon_output/
+experiments/
+# Sidecar runtime annotated image (rewritten each /detect call)
+action_server_annotated.jpg
