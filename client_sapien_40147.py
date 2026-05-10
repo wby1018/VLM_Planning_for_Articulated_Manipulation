@@ -262,6 +262,56 @@ def get_agent_pos(hand_link, panda):
     res = np.concatenate([eef_pos, orient_6d, [g]])
     return res.astype(np.float32)[None, :]  # (1, 10)
 
+
+def infer_moving_link_from_grasp_pose(seg_buf, cam, lf_link, rf_link,
+                                      cabinet_link_seg_map, window_half=7):
+    """Infer which cabinet link the gripper just grasped (Sub-milestone 1a).
+
+    Called once at the Grasp → ProbePull transition. Projects the finger-tip
+    midpoint world coordinate onto the SAPIEN camera image plane, looks up
+    `seg_buf[v, u, 1]` (per_scene_id channel) in a (2*window_half+1)² window,
+    and votes for the cabinet link with the most pixels in that window.
+
+    Returns the SAM3 prompt name (key of `cabinet_link_seg_map`) or None.
+    """
+    lf_pos = np.array(lf_link.entity.get_pose().p, dtype=np.float64)
+    rf_pos = np.array(rf_link.entity.get_pose().p, dtype=np.float64)
+    finger_tip_world = (lf_pos + rf_pos) / 2.0
+
+    # World → camera coords via inverse model_matrix (cam→world).
+    M = cam.get_model_matrix()
+    p_cam = (np.linalg.inv(M) @ np.array([*finger_tip_world, 1.0]))[:3]
+    if p_cam[2] >= 0:    # SAPIEN: cam z<0 = forward; positive means behind cam
+        return None
+
+    # Pinhole project (square pixel, ideal model — same as get_point_cloud_from_buffers).
+    H, W = seg_buf.shape[:2]
+    fy = (H / 2.0) / np.tan(cam.fovy / 2.0)
+    fx = fy
+    u = int(fx * p_cam[0] / (-p_cam[2]) + W / 2.0)
+    v = int(fy * p_cam[1] / (-p_cam[2]) + H / 2.0)
+    if not (0 <= u < W and 0 <= v < H):
+        return None
+
+    # Vote in a (2*window_half+1)² window — single pixel may hit panda finger
+    # geometry whose seg_id isn't in cabinet_link_seg_map.
+    u0, u1 = max(0, u - window_half), min(W, u + window_half + 1)
+    v0, v1 = max(0, v - window_half), min(H, v + window_half + 1)
+    seg_window = seg_buf[v0:v1, u0:u1, 1].astype(np.int32)
+
+    inv_map = {sid: prompt for prompt, sid in cabinet_link_seg_map.items()}
+    counts = {}
+    for sid in seg_window.ravel():
+        prompt = inv_map.get(int(sid))
+        if prompt is not None:
+            counts[prompt] = counts.get(prompt, 0) + 1
+    if not counts:
+        return None
+    inferred = max(counts, key=counts.get)
+    print(f"[client] infer_moving_link finger@({u},{v}) vote={counts} → {inferred!r}")
+    return inferred
+
+
 # -----------------
 # 数值雅可比 IK
 # -----------------
@@ -351,10 +401,16 @@ class ZMQCommunicationThread(threading.Thread):
                                           dtype=action_raw['dtype']).reshape(action_raw['shape'])
 
                 # 存入结果队列（覆盖旧的，只保留最新的）
+                # Sub-milestone 1a: pack action + stage so main loop can detect
+                # Grasp completion and sync sidecar's moving-part assignment.
+                msg = {
+                    'action': np_action,
+                    'stage':  action_raw.get('stage', 'UNKNOWN'),
+                }
                 if not self.action_queue.empty():
                     try: self.action_queue.get_nowait()
                     except: pass
-                self.action_queue.put(np_action)
+                self.action_queue.put(msg)
 
             except queue.Empty:
                 continue
@@ -558,6 +614,12 @@ def main():
     recon_frame_idx = 0
     last_recon_send_wall_time = 0.0  # seconds, w.r.t. start_wall_time
 
+    # Sub-milestone 1a: track ActionPlanner stage transitions to sync sidecar's
+    # moving-part assignment when Grasp completes.
+    prev_stage = 'UNKNOWN'
+    current_stage = 'UNKNOWN'
+    moving_link_synced = False  # latched True after first successful /set_moving_part
+
     try:
         while True:
             if viewer is not None and viewer.closed: break
@@ -566,7 +628,10 @@ def main():
             
             # --- 1. 检查是否有新 Action 到达 ---
             if not comm_thread.action_queue.empty():
-                np_action = comm_thread.action_queue.get()
+                msg = comm_thread.action_queue.get()
+                # Sub-milestone 1a: action_queue now carries {'action', 'stage'}.
+                np_action     = msg['action']
+                current_stage = msg.get('stage', 'UNKNOWN')
                 goal_pos     = np_action[:3].astype(np.float64)
                 goal_rot_6d  = np_action[3:9]
                 goal_grip    = float(np_action[9]) if len(np_action) > 9 else 0.04
@@ -683,6 +748,36 @@ def main():
                     'rgb': cur_rgb, 'depth': cur_depth, 'cam_pos': cam_pos, 'cam_mat': cam_mat, 'fovy': np.array([fovy]),
                 }
                 comm_thread.obs_queue.put(obs_msg)
+
+                # === Sub-milestone 1a: at Grasp completion, infer which cabinet
+                # link the gripper grasped (via SAPIEN seg buffer at finger-tip
+                # projection), and POST /set_moving_part so sidecar tracks the
+                # right part. Latched after first success. ===
+                if (recon_initialized
+                        and not moving_link_synced
+                        and prev_stage == 'Grasp'
+                        and current_stage != 'Grasp'):
+                    inferred = infer_moving_link_from_grasp_pose(
+                        seg_buf, cam, lf_link, rf_link, cabinet_link_seg_map
+                    )
+                    if inferred is not None:
+                        statics = [p for p in cabinet_link_seg_map.keys() if p != inferred]
+                        try:
+                            r = requests.post(
+                                f"{RECON_URL}/set_moving_part",
+                                data=pickle.dumps({'moving': inferred, 'static': statics}),
+                                timeout=10,
+                            )
+                            j = r.json()
+                            if j.get('ok'):
+                                tag = "noop" if j.get('noop') else "switched"
+                                print(f"[client] /set_moving_part {tag}: moving={inferred!r}")
+                                moving_link_synced = True
+                            else:
+                                print(f"[client] /set_moving_part returned not-ok: {j}")
+                        except Exception as e:
+                            print(f"[client] /set_moving_part failed (non-fatal): {e}")
+                prev_stage = current_stage
 
                 # === Reconstruction sidecar: init on first frame, ingest periodically (wall-time based) ===
                 if not recon_initialized:

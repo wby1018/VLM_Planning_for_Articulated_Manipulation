@@ -203,6 +203,66 @@ def _do_ingest(payload: dict) -> dict:
         return {"ok": False, "error": str(e), "tb": tb[-2000:]}
 
 
+def _do_set_moving_part(payload: dict) -> dict:
+    """Sub-milestone 1a: switch sidecar's tracked moving/static partition at
+    runtime.
+
+    Called by client_sapien once the gripper has Grasped a part — client
+    inferred which cabinet link was actually grasped (via SAPIEN seg buffer
+    at the projected finger-tip pixel) and pushes that here. Sidecar then
+    rewrites SceneState.moving_parts/static_parts/parts, drops accumulated
+    per-part data (depth_pts, mask_history, obb), clears the TSDF cache,
+    and resets the SAM3 part list + GT-mask shim cache so subsequent
+    /ingest_frame calls converge from scratch on the right part.
+
+    Idempotent: noop when the requested partition matches current state.
+    """
+    if state is None:
+        return {"ok": False, "error": "not initialized; POST /init first"}
+
+    moving = payload['moving']
+    static = list(payload.get('static', []))
+    new_parts = [moving] + static
+
+    if state.moving_parts == [moving] and state.static_parts == static:
+        print(f"[recon] /set_moving_part noop (already moving={moving!r})", flush=True)
+        return {"ok": True, "noop": True, "moving": moving, "static": static}
+
+    # Drop accumulated per-part artefacts so Phase B/C re-converge on the new
+    # part rather than averaging over the previous one.
+    state_dir = Path(getattr(state, "state_dir", "/tmp"))
+    per_part = state_dir / "per_part"
+    cleared = []
+    if per_part.exists():
+        for part_dir in per_part.iterdir():
+            if not part_dir.is_dir():
+                continue
+            mh = part_dir / "mask_history"
+            if mh.exists():
+                for f in mh.glob("*.npy"):
+                    f.unlink()
+            for fname in ("depth_pts.npy", "depth_pts_frame.npy", "obb.json"):
+                p = part_dir / fname
+                if p.exists():
+                    p.unlink()
+            cleared.append(part_dir.name)
+
+    state.parts = list(new_parts)
+    state.moving_parts = [moving]
+    state.static_parts = list(static)
+    if hasattr(state, "tsdfs"):
+        state.tsdfs.clear()
+
+    if sam3 is not None:
+        sam3.set_parts(list(new_parts))
+        if hasattr(sam3, "_gt_masks"):
+            sam3._gt_masks.clear()
+
+    print(f"[recon] /set_moving_part moving={moving!r} static={static} "
+          f"cleared={cleared}", flush=True)
+    return {"ok": True, "moving": moving, "static": static, "cleared": cleared}
+
+
 def _do_emit(payload: dict) -> dict:
     if state is None:
         return {"ok": False, "error": "not initialized"}
@@ -246,6 +306,17 @@ async def emit(req: Request):
     """Body (pickle): {'out_dir': str}"""
     payload = pickle.loads(await req.body())
     return _do_emit(payload)
+
+
+@app.post("/set_moving_part")
+async def set_moving_part(req: Request):
+    """Body (pickle): {'moving': str, 'static': list[str]}.
+
+    See `_do_set_moving_part` for semantics. Called by client_sapien when it
+    detects ActionPlanner has finished Grasp (Sub-milestone 1a).
+    """
+    payload = pickle.loads(await req.body())
+    return _do_set_moving_part(payload)
 
 
 @app.get("/health")

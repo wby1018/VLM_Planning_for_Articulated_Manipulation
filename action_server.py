@@ -71,7 +71,9 @@ USE_VISUALIZER   = True
 
 # USER_INSTRUCTION = "open the cabinet door"
 # USER_INSTRUCTION = "open the second bottom drawer"
-USER_INSTRUCTION = "open the drawer"   # 40147 has exactly one drawer; less ambiguous than "second bottom drawer" which doesn't exist on this URDF
+# Default is "open the drawer"; override by exporting USER_INSTRUCTION env var
+# before launching (e.g. `USER_INSTRUCTION="open the cabinet door" ./run_all.sh 40147`).
+USER_INSTRUCTION = os.environ.get("USER_INSTRUCTION", "open the drawer")
 
 # Motion tuning
 APPROACH_DIST   = 0.10   # m — standoff before grasping
@@ -1040,6 +1042,19 @@ class ActionPlanner:
 
     # ── public ──────────────────────────────────────────────────────────────
 
+    @property
+    def current_stage(self) -> str:
+        """Name of the stage currently being executed.
+
+        Returns the stage list entry at `stage_idx` when in EXECUTING state;
+        falls back to the high-level state name (INIT / DONE / ERROR) otherwise.
+        Used by the ZMQ reply so client_sapien can detect Grasp completion and
+        sync the sidecar's moving-part assignment (Sub-milestone 1a).
+        """
+        if 0 <= self.stage_idx < len(self.stages):
+            return self.stages[self.stage_idx]
+        return self.state
+
     def reset(self):
         self._reset()
 
@@ -1761,6 +1776,10 @@ def main():
                 'shape': action.shape,
                 'dtype': str(action.dtype),
                 'data' : action.tobytes(),
+                # Sub-milestone 1a: expose ActionPlanner stage to client so it
+                # can detect Grasp completion and POST /set_moving_part to the
+                # sidecar with the inferred moving-link.
+                'stage': planner.current_stage,
             }
             socket.send(zlib.compress(pickle.dumps(reply, protocol=pickle.HIGHEST_PROTOCOL)))
         else:
