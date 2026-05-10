@@ -284,12 +284,15 @@ def infer_moving_link_from_grasp_pose(seg_buf, cam, lf_link, rf_link,
     if p_cam[2] >= 0:    # SAPIEN: cam z<0 = forward; positive means behind cam
         return None
 
-    # Pinhole project (square pixel, ideal model — same as get_point_cloud_from_buffers).
+    # Pinhole project. SAPIEN model_matrix is OpenGL convention (cam X-right,
+    # Y-up, -Z-forward); image origin is top-left with Y-down. So the V axis
+    # gets a sign flip on p_cam[1] — empirically verified in test runs where
+    # the un-flipped version landed on the opposite cabinet half.
     H, W = seg_buf.shape[:2]
     fy = (H / 2.0) / np.tan(cam.fovy / 2.0)
     fx = fy
-    u = int(fx * p_cam[0] / (-p_cam[2]) + W / 2.0)
-    v = int(fy * p_cam[1] / (-p_cam[2]) + H / 2.0)
+    u = int( fx * p_cam[0] / (-p_cam[2]) + W / 2.0)
+    v = int(-fy * p_cam[1] / (-p_cam[2]) + H / 2.0)
     if not (0 <= u < W and 0 <= v < H):
         return None
 
@@ -308,7 +311,8 @@ def infer_moving_link_from_grasp_pose(seg_buf, cam, lf_link, rf_link,
     if not counts:
         return None
     inferred = max(counts, key=counts.get)
-    print(f"[client] infer_moving_link finger@({u},{v}) vote={counts} → {inferred!r}")
+    print(f"[client] infer_moving_link tip_world={tuple(round(float(x),3) for x in finger_tip_world)} "
+          f"finger@({u},{v}) of {W}x{H} vote={counts} → {inferred!r}")
     return inferred
 
 
