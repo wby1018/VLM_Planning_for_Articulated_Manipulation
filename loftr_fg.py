@@ -49,8 +49,8 @@ SIGMA_GRIP        = 0.005   # gripper trajectory factor noise (m)
 SIGMA_VIS         = 0.010    # adjacent-frame vis noise (m) — weakened, auxiliary only
 SIGMA_DTHETA      = 0.03    # angle continuity factor noise (rad)
 SIGMA_PRIOR_OMEGA = 0.01    # prior noise on ω direction
-SIGMA_PRIOR_V     = 0.05    # prior noise on v (axis position)
-SIGMA_MONO        = 0.05    # monotone angle factor noise (rad)
+SIGMA_PRIOR_V     = 0.01    # prior noise on v (axis position)
+SIGMA_MONO        = 0.01    # monotone angle factor noise (rad)
 W_NORM            = 50.0    # soft unit-norm penalty weight for ω
 MAX_VIS_PTS       = 100      # max LoFTR points subsampled per observation
 WINDOW_SIZE       = 25      # sliding-window frame count
@@ -358,7 +358,8 @@ class AxisFG:
                    src_pts: np.ndarray = None,
                    tgt_pts: np.ndarray = None,
                    kf_vis_list: list = None,
-                   dtheta_init: float = 0.0):
+                   dtheta_init: float = 0.0,
+                   optimize: bool = True):
         """
         Register a new frame and re-optimise the window.
 
@@ -419,7 +420,8 @@ class AxisFG:
                 ))
 
         self._trim()
-        self._optimize()
+        if optimize:
+            self._optimize()
 
     def get_axis(self):
         """Return (pivot_3d, omega_unit_3d, theta_current)."""
@@ -682,6 +684,7 @@ class LoFTRAxisEstimatorFG:
         # Keyframe buffer — each entry is a dict:
         # { frame_id, depth, rgb_bgr, c2w, theta_abs, fg_push_idx }
         self._keyframes: list = []
+        self._last_opt_gate_kf_count = -1
 
         self.visualize = visualize
         self._vis = Visualizer() if visualize else None
@@ -845,14 +848,23 @@ class LoFTRAxisEstimatorFG:
                     #       f"{len(src_rec)} matches, Δθ={np.rad2deg(dtheta_frozen):.1f}°")
 
         # ----------------------------------------------------------------
-        # Push frame into FG and optimise
+        # Push frame into FG. Keep the axis fixed until the first non-anchor
+        # keyframe exists; one anchor alone is too short-baseline for stable axis optimisation.
         # ----------------------------------------------------------------
+        allow_axis_opt = len(self._keyframes) >= 2
+        if (not allow_axis_opt
+                and len(self._keyframes) != self._last_opt_gate_kf_count):
+            print(f"[Frame {frame_id}] FG optimize gated: KFs={len(self._keyframes)}/2; "
+                  "accumulating frames without axis optimisation.")
+            self._last_opt_gate_kf_count = len(self._keyframes)
+
         self.fg.push_frame(
             ee_pos=ee_curr,
             src_pts=src_w,
             tgt_pts=tgt_w,
             kf_vis_list=kf_vis_list if kf_vis_list else None,
             dtheta_init=dtheta_init,
+            optimize=allow_axis_opt,
         )
 
         pivot, n_dir, theta = self.fg.get_axis()
@@ -890,6 +902,10 @@ class LoFTRAxisEstimatorFG:
         if not self._fg_initialized:
             return None, None
         return self.fg.get_uncertainty()
+
+    def get_keyframe_count(self) -> int:
+        """Return the number of keyframes currently stored."""
+        return len(self._keyframes)
 
     # ------------------------------------------------------------------
     # Keyframe management

@@ -31,6 +31,7 @@ Client → Server  compressed pickle of obs_dict:
   'fovy'       : {'shape':(1,),   'dtype':'float64', 'data':bytes}  — vertical FoV (deg)
   'agent_pos'  : {'shape':(1,T,10),'dtype':'float32','data':bytes}  — eef[3]+rot6d[6]+g[1]
   'point_cloud': {'shape':(1,T,1280,3),'dtype':'float32','data':bytes}
+  'link_poses' : {'shape':(12,3), 'dtype':'float32','data':bytes}   — optional Panda link positions
 
 Server → Client  compressed pickle of action_dict:
   {'shape':(10,), 'dtype':'float32', 'data':bytes}
@@ -43,8 +44,10 @@ import os
 import pickle
 import queue
 import threading
+import time
 import traceback
 import zlib
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -75,8 +78,20 @@ USE_VISUALIZER   = True
 # before launching (e.g. `USER_INSTRUCTION="open the cabinet door" ./run_all.sh 40147`).
 USER_INSTRUCTION = os.environ.get("USER_INSTRUCTION", "open the drawer")
 
+# Cache
+CACHE_FILE_PREFIX    = "action_server_cache"
+CACHE_HANDLE_TOL     = 0.05   # m — match cached entry by handle 3D position
+CACHE_DET_INDEX_OFFSET = 1000
+CACHE_MARKER_HALF_SIZE = 22  # pixels — virtual bbox around projected cached handle
+
+# Push parameters (mirror of Pull settings)
+PUSH_STEP            = 0.005  # m per step
+PUSH_ANG_STEP        = np.deg2rad(0.4)  # rad per step (for Push_Arc)
+PUSH_STALL_POS_EPS   = 0.002  # m — EE movement below this counts as stalled
+PUSH_STALL_TIMEOUT   = 3.0    # s — finish Push if EE stays stalled this long
+
 # Motion tuning
-APPROACH_DIST   = 0.10   # m — standoff before grasping
+APPROACH_DIST   = 0.15   # m — standoff before grasping
 STAGE_POS_TOL   = 0.03   # m — position tolerance for Grasp / ProbePull / Pull_* stages
 APPROACH_POS_TOL = 0.05  # m — position tolerance for MoveTo / Approach (looser)
 STAGE_ANG_TOL   = 0.08   # rad
@@ -95,7 +110,7 @@ NORMAL_SCAN_RADIUS = 0.15 # m — radius around handle to sample panel points
 
 PULL_LINEAR_DIST = 0.38  # m total drawer pull
 PULL_STEP        = 0.005  # m per step increment
-PULL_ARC_ANGLE   = np.deg2rad(80)  # total door sweep
+PULL_ARC_ANGLE   = np.deg2rad(50)  # total door sweep
 ARC_STEP         = np.deg2rad(0.4)  # rad per step
 
 # ProbePull / TypeCheck
@@ -105,11 +120,40 @@ PROBE_DISTANCE       = 0.05   # m — small pull for type identification.
 # travel; longer probe targets are physically unreachable, ProbePull never
 # completes (`pulled >= PROBE_DISTANCE - 0.005` stays false), task hangs.
 TYPECHECK_MARGIN     = 0.002  # m — margin for Translation vs Rotation decision
+TYPECHECK_VISUALIZE_OPEN3D = False  # blocking Open3D window after TypeCheck
 EDGE_PERCENTILE      = 10     # % — edge band width for axis fitting
+EDGE_AXIS_FILTER_PERCENTILE = 10.0   # % — xyz percentile outlier filter before edge fitting
+EDGE_AXIS_FILTER_EXPAND_RATIO = 0.2 # expand filtered xyz bounds by this fraction
+EDGE_AXIS_SPATIAL_RADIUS = 0.035    # m — neighbour radius for post-percentile denoising
+EDGE_AXIS_MIN_NEIGHBORS = 6         # min neighbours inside radius to keep a point
+EDGE_RECT_BOUND_PERCENTILE = 3.0    # % — robust rectangle bounds after denoising
+EDGE_RECT_EXPAND_RATIO = 0.1       # expand final 2-D rectangle bounds by this fraction
 CHAMFER_TRIM_RATIO   = 0.9    # top 90% nearest-neighbour distances used
 MIN_PROBE_PCD_POINTS = 20     # minimum points in P0/P1 for TypeCheck
 MIN_TYPECHECK_THETA  = 0.01   # rad — minimum rotation angle to consider
-ARC_SMOOTH_ALPHA     = 0.8    # smoothing factor for LoFTR axis update
+ARC_SMOOTH_ALPHA     = 1    # smoothing factor for LoFTR axis update
+
+# Robot point filtering (same model as loftr_fg.py)
+ROBOT_LINK_NAMES = [
+    "panda_link0", "panda_link1", "panda_link2", "panda_link3", "panda_link4",
+    "panda_link5", "panda_link6", "panda_link7", "panda_link8",
+    "panda_hand", "panda_leftfinger", "panda_rightfinger",
+]
+R_ARM, R_FOREARM, R_HAND, R_FINGER = 0.15, 0.13, 0.07, 0.03
+ROBOT_CONNECTIONS = [
+    ("panda_link0", "panda_link1", R_ARM),
+    ("panda_link1", "panda_link2", R_ARM),
+    ("panda_link2", "panda_link3", R_ARM),
+    ("panda_link3", "panda_link4", R_ARM),
+    ("panda_link4", "panda_link5", R_FOREARM),
+    ("panda_link5", "panda_link6", R_FOREARM),
+    ("panda_link6", "panda_link7", R_FOREARM),
+    ("panda_link7", "panda_link8", R_FOREARM),
+    ("panda_hand", "panda_leftfinger", R_HAND),
+    ("panda_hand", "panda_rightfinger", R_HAND),
+    ("panda_leftfinger", "panda_leftfinger", R_FINGER),
+    ("panda_rightfinger", "panda_rightfinger", R_FINGER),
+]
 
 # ─────────────────────────── Rotation helpers ─────────────────────────────────
 
@@ -147,6 +191,116 @@ def look_at_rotation(forward: np.ndarray,
     x = right / (np.linalg.norm(right) + 1e-8)
     y = np.cross(z, x)
     return np.stack([x, y, z], axis=1)
+
+# ─────────────────────────── Cache Manager ────────────────────────────────────
+
+def make_timestamped_cache_path() -> str:
+    """Return a per-server-run cache path with a timestamp suffix."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{CACHE_FILE_PREFIX}_{stamp}.json"
+
+
+class CacheManager:
+    """
+    Persistent JSON cache of articulated-object motion parameters keyed by
+    handle 3D world position. Stored as a list of entries; each entry holds:
+      handle_pos        : closed-state 3D handle position (anchor for matching)
+      motion_type       : "Translation" | "Rotation"
+      panel_normal      : outward face normal at the handle
+      approach_quat     : base wxyz gripper orientation
+      slide_dir         : Translation only — unit "open" direction
+      screw_axis_point  : Rotation only — point on hinge axis
+      screw_axis_dir    : Rotation only — signed axis direction (positive = open)
+      current_open      : signed scalar — distance (m) or angle (rad) currently open
+    """
+
+    def __init__(self, path: Optional[str] = None):
+        self.path = path or make_timestamped_cache_path()
+        self.entries: List[Dict[str, Any]] = []
+        print(f"[Cache] Using cache file: {self.path}")
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+            self.entries = data.get("entries", [])
+            print(f"[Cache] Loaded {len(self.entries)} entries from {self.path}")
+        except Exception as e:
+            print(f"[Cache] Failed to load {self.path}: {e}")
+            self.entries = []
+
+    def save(self) -> None:
+        try:
+            with open(self.path, "w") as f:
+                json.dump({"entries": self.entries}, f, indent=2)
+            print(f"[Cache] Saved {len(self.entries)} entries to {self.path}")
+        except Exception as e:
+            print(f"[Cache] Save failed: {e}")
+
+    @staticmethod
+    def _effective_handle_pos(entry: Dict[str, Any]) -> np.ndarray:
+        """Return the current world handle position implied by entry.current_open."""
+        closed = np.asarray(entry["handle_pos"], dtype=np.float64)
+        cur = float(entry.get("current_open", 0.0))
+        if abs(cur) < 1e-6:
+            return closed
+        if entry["motion_type"] == "Translation":
+            slide_dir = np.asarray(entry["slide_dir"], dtype=np.float64)
+            return closed + slide_dir * cur
+        else:
+            axis_pt = np.asarray(entry["screw_axis_point"], dtype=np.float64)
+            axis_dir = np.asarray(entry["screw_axis_dir"], dtype=np.float64)
+            return rotate_around_axis(closed, axis_pt, axis_dir, cur)
+
+    def find(self, detected_handle_pos: np.ndarray,
+             tol: float = CACHE_HANDLE_TOL) -> Optional[Dict[str, Any]]:
+        """Find entry whose closed- or current-state handle matches within tol."""
+        detected = np.asarray(detected_handle_pos, dtype=np.float64)
+        for e in self.entries:
+            closed = np.asarray(e["handle_pos"], dtype=np.float64)
+            if np.linalg.norm(detected - closed) < tol:
+                return e
+            if abs(float(e.get("current_open", 0.0))) > 1e-6:
+                effective = self._effective_handle_pos(e)
+                if np.linalg.norm(detected - effective) < tol:
+                    return e
+        return None
+
+    def upsert(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert or replace an entry, matching existing by closed handle_pos."""
+        closed_new = np.asarray(entry["handle_pos"], dtype=np.float64)
+        for i, e in enumerate(self.entries):
+            existing = np.asarray(e["handle_pos"], dtype=np.float64)
+            if np.linalg.norm(closed_new - existing) < CACHE_HANDLE_TOL:
+                self.entries[i] = entry
+                self.save()
+                return self.entries[i]
+        self.entries.append(entry)
+        self.save()
+        return self.entries[-1]
+
+    def update_open(self, entry: Dict[str, Any], current_open: float) -> None:
+        """Update the current_open value of an existing entry (matched by identity)."""
+        for e in self.entries:
+            if e is entry:
+                e["current_open"] = float(current_open)
+                self.save()
+                return
+        # Fall back to closed handle_pos match
+        closed = np.asarray(entry["handle_pos"], dtype=np.float64)
+        for e in self.entries:
+            existing = np.asarray(e["handle_pos"], dtype=np.float64)
+            if np.linalg.norm(closed - existing) < CACHE_HANDLE_TOL:
+                e["current_open"] = float(current_open)
+                self.save()
+                return
+        # Not present — insert
+        entry["current_open"] = float(current_open)
+        self.upsert(entry)
+
 
 # ─────────────────────────── Deserialisation helper ───────────────────────────
 
@@ -187,6 +341,24 @@ def backproject_pixel(u: float, v: float, depth_val: float,
     return cam_pos + cam_mat @ np.array([x_cam, y_cam, z_cam])
 
 
+def project_world_to_pixel(point_world: np.ndarray,
+                           cam_pos: np.ndarray,
+                           cam_mat: np.ndarray,
+                           fovy_deg: float,
+                           h: int,
+                           w: int) -> Optional[Tuple[float, float, float]]:
+    """Project a world-space point to image pixel coordinates."""
+    p_cam = cam_mat.T @ (np.asarray(point_world, dtype=np.float64) - cam_pos)
+    depth_val = -float(p_cam[2])
+    if depth_val <= 1e-6:
+        return None
+
+    f = (h / 2.0) / np.tan(np.deg2rad(fovy_deg) / 2.0)
+    u = (p_cam[0] * f / depth_val) + (w / 2.0)
+    v = (h / 2.0) - (p_cam[1] * f / depth_val)
+    return float(u), float(v), depth_val
+
+
 def backproject_mask_to_pcd(depth: np.ndarray, mask: np.ndarray,
                              cam_pos: np.ndarray, cam_mat: np.ndarray,
                              fovy_deg: float,
@@ -215,6 +387,80 @@ def backproject_mask_to_pcd(depth: np.ndarray, mask: np.ndarray,
     local_pts = np.stack([x_c, y_c, z_c], axis=1)   # (N,3)
     world_pts = cam_pos + (cam_mat @ local_pts.T).T  # (N,3)
     return world_pts
+
+
+def link_pose_array_to_dict(link_poses: Optional[np.ndarray]) -> Dict[str, np.ndarray]:
+    """Convert fixed-order link pose array to {link_name: world_pos}."""
+    if link_poses is None:
+        return {}
+
+    arr = np.asarray(link_poses, dtype=np.float64)
+    if arr.ndim == 4:
+        arr = arr[0, -1]
+    elif arr.ndim == 3:
+        arr = arr[-1]
+    if arr.ndim != 2 or arr.shape[1] < 3:
+        return {}
+
+    poses: Dict[str, np.ndarray] = {}
+    for name, pos in zip(ROBOT_LINK_NAMES, arr[:, :3]):
+        if np.all(np.isfinite(pos)):
+            poses[name] = pos.copy()
+    return poses
+
+
+def dist_to_robot_segments(pts: np.ndarray, segments) -> np.ndarray:
+    """Return mask of points inside any robot link capsule."""
+    inside = np.zeros(len(pts), dtype=bool)
+    for A, B, radius in segments:
+        A = np.asarray(A, dtype=np.float64)
+        B = np.asarray(B, dtype=np.float64)
+        AB = B - A
+        mag_sq = float(np.dot(AB, AB))
+        if mag_sq < 1e-6:
+            dist = np.linalg.norm(pts - A, axis=1)
+        else:
+            AP = pts - A
+            t = np.clip(np.sum(AP * AB, axis=1) / mag_sq, 0.0, 1.0)
+            closest = A + t[:, None] * AB
+            dist = np.linalg.norm(pts - closest, axis=1)
+        inside |= dist < radius
+    return inside
+
+
+def get_robot_segments(link_pose_dict: Dict[str, np.ndarray]):
+    """Build robot link capsules from a link-pose dict."""
+    segs = []
+    for start, end, radius in ROBOT_CONNECTIONS:
+        if start in link_pose_dict and end in link_pose_dict:
+            segs.append((link_pose_dict[start], link_pose_dict[end], radius))
+    return segs
+
+
+def filter_robot_points_pair(P0: np.ndarray, P1: np.ndarray,
+                             link_poses0: Dict[str, np.ndarray],
+                             link_poses1: Dict[str, np.ndarray]
+                             ) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    Remove dynamic probe points that lie on the robot in either frame.
+    Uses pairwise masking so P0/P1 remain indexed by the same dynamic pixels.
+    """
+    if len(P0) == 0 or len(P1) == 0:
+        return P0, P1, 0, 0
+
+    segs0 = get_robot_segments(link_poses0)
+    segs1 = get_robot_segments(link_poses1)
+    if not segs0 and not segs1:
+        return P0, P1, 0, 0
+
+    bad = np.zeros(min(len(P0), len(P1)), dtype=bool)
+    if segs0:
+        bad |= dist_to_robot_segments(P0[:len(bad)], segs0)
+    if segs1:
+        bad |= dist_to_robot_segments(P1[:len(bad)], segs1)
+
+    keep = ~bad
+    return P0[:len(keep)][keep], P1[:len(keep)][keep], int(bad.sum()), len(keep)
 
 
 def rotate_around_axis(point: np.ndarray, axis_point: np.ndarray,
@@ -343,18 +589,94 @@ def fit_3d_line_ransac(pts: np.ndarray,
     }
 
 
+def filter_pcd_by_expanded_xyz_percentiles(
+        pts: np.ndarray,
+        percentile: float = EDGE_AXIS_FILTER_PERCENTILE,
+        expand_ratio: float = EDGE_AXIS_FILTER_EXPAND_RATIO) -> np.ndarray:
+    """
+    Remove far outliers using xyz percentile bounds, then expand the main
+    cloud box by a ratio so real edge points are not clipped too aggressively.
+    """
+    if len(pts) == 0:
+        return pts
+
+    p = float(np.clip(percentile, 0.0, 49.0))
+    lo = np.percentile(pts, p, axis=0)
+    hi = np.percentile(pts, 100.0 - p, axis=0)
+    span = np.maximum(hi - lo, 1e-6)
+    lo = lo - span * float(expand_ratio)
+    hi = hi + span * float(expand_ratio)
+
+    mask = np.all((pts >= lo) & (pts <= hi), axis=1)
+    return pts[mask]
+
+
+def prepare_edge_axis_cloud(P0: np.ndarray) -> np.ndarray:
+    """Return the point cloud used specifically for edge-axis fitting."""
+    if len(P0) < 30:
+        return P0
+
+    P0_filtered = filter_pcd_by_expanded_xyz_percentiles(P0)
+    if len(P0_filtered) < 30:
+        print(f"[TypeCheck] Edge axis xyz filter left only {len(P0_filtered)} pts; "
+              "using unfiltered cloud for axis fitting.")
+        return P0
+
+    if len(P0_filtered) < len(P0):
+        print(f"[TypeCheck] Edge axis xyz filter: kept {len(P0_filtered)}/{len(P0)} pts "
+              f"(p={EDGE_AXIS_FILTER_PERCENTILE:.1f}%, "
+              f"expand={EDGE_AXIS_FILTER_EXPAND_RATIO:.2f})")
+    return P0_filtered
+
+
+def spatial_filter_axis_cloud(pts: np.ndarray,
+                              radius: float = EDGE_AXIS_SPATIAL_RADIUS,
+                              min_neighbors: int = EDGE_AXIS_MIN_NEIGHBORS
+                              ) -> np.ndarray:
+    """Remove isolated points after percentile filtering using local density."""
+    if len(pts) < max(30, min_neighbors + 1):
+        return pts
+
+    tree = KDTree(pts)
+    neighbours = tree.query_ball_point(pts, r=radius)
+    counts = np.array([len(n) for n in neighbours], dtype=np.int32)
+    mask = counts >= int(min_neighbors)
+    filtered = pts[mask]
+
+    if len(filtered) < 30:
+        print(f"[TypeCheck] Edge axis spatial filter left only {len(filtered)} pts; "
+              "using percentile-filtered cloud.")
+        return pts
+
+    if len(filtered) < len(pts):
+        print(f"[TypeCheck] Edge axis spatial filter: kept {len(filtered)}/{len(pts)} pts "
+              f"(r={radius:.3f}m, min_n={min_neighbors})")
+    return filtered
+
+
 def estimate_edge_axes(P0: np.ndarray,
-                        percentile: int = EDGE_PERCENTILE
+                        percentile: int = EDGE_PERCENTILE,
+                        filter_outliers: bool = True
                         ) -> List[Dict[str, Any]]:
     """
-    Fit 3-D lines to the four edge bands (left, right, bottom, top) of P0.
+    Estimate the four edges of a 3-D rectangle enclosing P0.
+
+    The rectangle is represented in a 2-D frame embedded in 3-D:
+      horizontal axis = XY-plane PCA direction,
+      vertical axis   = world Z.
+    Thus the top/bottom edges are always perpendicular to world Z, and the
+    left/right edges are vertical.
 
     Each returned dict contains: side, point, dir, fit_error, n_inliers.
     """
     if len(P0) < 30:
         return []
 
-    # Determine horizontal direction by XY-plane PCA
+    if filter_outliers:
+        P0 = prepare_edge_axis_cloud(P0)
+    P0 = spatial_filter_axis_cloud(P0)
+
+    # Determine the horizontal rectangle axis by XY-plane PCA.
     ctr = P0.mean(axis=0)
     pts_xy = P0[:, :2] - ctr[:2]
     _, _, Vt_2d = np.linalg.svd(pts_xy, full_matrices=False)
@@ -365,45 +687,174 @@ def estimate_edge_axes(P0: np.ndarray,
         return []
     horizontal_dir /= hn
 
-    # Side direction: perpendicular to horizontal in XY plane
-    side_dir = np.array([-horizontal_dir[1], horizontal_dir[0], 0.0])
+    z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    plane_normal = np.cross(horizontal_dir, z_axis)
+    pn = np.linalg.norm(plane_normal)
+    if pn < 1e-6:
+        return []
+    plane_normal /= pn
 
-    side_proj = P0 @ side_dir  # projection onto side direction
-    z_proj    = P0[:, 2]        # world height
+    u = P0 @ horizontal_dir
+    z = P0[:, 2]
+    w = P0 @ plane_normal
 
-    axes = []
-    configs = [
-        ("left",   side_proj, False),
-        ("right",  side_proj, True),
-        ("bottom", z_proj,    False),
-        ("top",    z_proj,    True),
+    p = float(np.clip(EDGE_RECT_BOUND_PERCENTILE, 0.0, 20.0))
+    u_min = float(np.percentile(u, p))
+    u_max = float(np.percentile(u, 100.0 - p))
+    z_min = float(np.percentile(z, p))
+    z_max = float(np.percentile(z, 100.0 - p))
+    w_mid = float(np.median(w))
+
+    u_span = u_max - u_min
+    z_span = z_max - z_min
+    if u_span < 1e-4 or z_span < 1e-4:
+        return []
+
+    expand = float(max(0.0, EDGE_RECT_EXPAND_RATIO))
+    u_min -= 0.5 * expand * u_span
+    u_max += 0.5 * expand * u_span
+    z_min -= 0.5 * expand * z_span
+    z_max += 0.5 * expand * z_span
+
+    z_mid = 0.5 * (z_min + z_max)
+    u_mid = 0.5 * (u_min + u_max)
+
+    def make_rect_point(u_val: float, z_val: float) -> np.ndarray:
+        return horizontal_dir * u_val + z_axis * z_val + plane_normal * w_mid
+
+    def mean_edge_distance(side: str, u_val: float = 0.0, z_val: float = 0.0) -> Tuple[float, int]:
+        if side in ("left", "right"):
+            d = np.abs(u - u_val)
+        else:
+            d = np.abs(z - z_val)
+        band = d <= np.percentile(d, max(5.0, float(percentile)))
+        return float(d[band].mean()) if np.any(band) else float(d.mean()), int(np.sum(band))
+
+    left_err, left_n = mean_edge_distance("left", u_val=u_min)
+    right_err, right_n = mean_edge_distance("right", u_val=u_max)
+    bottom_err, bottom_n = mean_edge_distance("bottom", z_val=z_min)
+    top_err, top_n = mean_edge_distance("top", z_val=z_max)
+
+    axes = [
+        {
+            "side": "left",
+            "point": make_rect_point(u_min, z_mid),
+            "dir": z_axis.copy(),
+            "segment": (make_rect_point(u_min, z_min), make_rect_point(u_min, z_max)),
+            "fit_error": left_err,
+            "n_inliers": left_n,
+            "rect_bounds": (u_min, u_max, z_min, z_max, w_mid),
+        },
+        {
+            "side": "right",
+            "point": make_rect_point(u_max, z_mid),
+            "dir": z_axis.copy(),
+            "segment": (make_rect_point(u_max, z_min), make_rect_point(u_max, z_max)),
+            "fit_error": right_err,
+            "n_inliers": right_n,
+            "rect_bounds": (u_min, u_max, z_min, z_max, w_mid),
+        },
+        {
+            "side": "bottom",
+            "point": make_rect_point(u_mid, z_min),
+            "dir": horizontal_dir.copy(),
+            "segment": (make_rect_point(u_min, z_min), make_rect_point(u_max, z_min)),
+            "fit_error": bottom_err,
+            "n_inliers": bottom_n,
+            "rect_bounds": (u_min, u_max, z_min, z_max, w_mid),
+        },
+        {
+            "side": "top",
+            "point": make_rect_point(u_mid, z_max),
+            "dir": horizontal_dir.copy(),
+            "segment": (make_rect_point(u_min, z_max), make_rect_point(u_max, z_max)),
+            "fit_error": top_err,
+            "n_inliers": top_n,
+            "rect_bounds": (u_min, u_max, z_min, z_max, w_mid),
+        },
     ]
 
-    for side, proj, use_upper in configs:
-        if use_upper:
-            thresh = float(np.percentile(proj, 100 - percentile))
-            edge_mask = proj >= thresh
-        else:
-            thresh = float(np.percentile(proj, percentile))
-            edge_mask = proj <= thresh
-
-        edge_pts = P0[edge_mask]
-        if len(edge_pts) < 5:
-            continue
-
-        line_res = fit_3d_line_ransac(edge_pts)
-        if line_res is None:
-            continue
-
-        axes.append({
-            "side":      side,
-            "point":     line_res["point"],
-            "dir":       line_res["dir"],
-            "fit_error": line_res["fit_error"],
-            "n_inliers": line_res["n_inliers"],
-        })
+    print(f"[TypeCheck] Edge rectangle: width={u_max - u_min:.3f}m, "
+          f"height={z_max - z_min:.3f}m, pts={len(P0)}")
 
     return axes
+
+
+def visualize_typecheck_open3d(P0: np.ndarray,
+                               P1: np.ndarray,
+                               P0_transformed: np.ndarray,
+                               axes: List[Dict[str, Any]],
+                               result: Dict[str, Any],
+                               P0_axis_fit: Optional[np.ndarray] = None) -> None:
+    """Blocking Open3D visualization for TypeCheck hypotheses."""
+    if not TYPECHECK_VISUALIZE_OPEN3D:
+        return
+
+    try:
+        import open3d as o3d
+    except Exception as exc:
+        print(f"[TypeCheck Vis] Open3D unavailable, skipping visualization: {exc}")
+        return
+
+    def make_pcd(points: np.ndarray, color: Tuple[float, float, float]):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+        pcd.paint_uniform_color(color)
+        return pcd
+
+    geometries = [
+        make_pcd(P0, (0.15, 0.35, 1.0)),            # original start cloud: blue
+        make_pcd(P0_transformed, (0.0, 0.85, 0.25)), # predicted transformed cloud: green
+        make_pcd(P1, (1.0, 0.55, 0.0)),             # observed end cloud: orange
+    ]
+    if P0_axis_fit is not None and len(P0_axis_fit) > 0:
+        geometries.append(make_pcd(P0_axis_fit, (0.92, 0.92, 0.92)))
+
+    all_clouds = [P0, P1, P0_transformed]
+    if P0_axis_fit is not None and len(P0_axis_fit) > 0:
+        all_clouds.append(P0_axis_fit)
+    all_pts = np.vstack(all_clouds)
+    diag = float(np.linalg.norm(all_pts.max(axis=0) - all_pts.min(axis=0)))
+    axis_len = float(np.clip(diag * 0.45, 0.12, 0.60))
+    axis_colors = {
+        "left":   (1.0, 0.0, 0.0),
+        "right":  (0.0, 1.0, 0.0),
+        "bottom": (1.0, 0.0, 1.0),
+        "top":    (0.0, 1.0, 1.0),
+    }
+
+    for ax in axes:
+        point = np.asarray(ax["point"], dtype=np.float64)
+        direction = np.asarray(ax["dir"], dtype=np.float64)
+        norm = np.linalg.norm(direction)
+        if norm < 1e-6:
+            continue
+        direction = direction / norm
+        if ax.get("segment") is not None:
+            p0 = np.asarray(ax["segment"][0], dtype=np.float64)
+            p1 = np.asarray(ax["segment"][1], dtype=np.float64)
+        else:
+            p0 = point - direction * axis_len
+            p1 = point + direction * axis_len
+        line = o3d.geometry.LineSet()
+        line.points = o3d.utility.Vector3dVector(np.vstack([p0, p1]))
+        line.lines = o3d.utility.Vector2iVector([[0, 1]])
+        color = axis_colors.get(ax.get("side"), (1.0, 1.0, 1.0))
+        if ax.get("side") == result.get("best_axis_side"):
+            color = (1.0, 1.0, 0.0)  # chosen rotation axis: yellow
+        line.colors = o3d.utility.Vector3dVector([color])
+        geometries.append(line)
+
+    frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.08)
+    geometries.append(frame)
+
+    print("[TypeCheck Vis] Open3D colors: P0 blue, transformed green, P1 orange, "
+          "axis-fit filtered P0 white, axes red/green/magenta/cyan, "
+          "chosen axis yellow. Close window to continue.")
+    title = (f"TypeCheck: {result.get('motion_type')} "
+             f"E_T={result.get('E_translation', float('nan')):.5f} "
+             f"E_R={result.get('E_rotation', float('nan')):.5f}")
+    o3d.visualization.draw_geometries(geometries, window_name=title)
 
 
 def type_check(P0: np.ndarray, P1: np.ndarray,
@@ -444,23 +895,35 @@ def type_check(P0: np.ndarray, P1: np.ndarray,
         return result
 
     dg = g1 - g0  # actual gripper displacement
+    n = np.asarray(panel_normal, dtype=np.float64)
+    n_norm = np.linalg.norm(n)
+    if n_norm > 1e-6:
+        n = n / n_norm
+    else:
+        n = np.zeros(3, dtype=np.float64)
+    dg_panel = float(np.dot(dg, n)) * n
 
     # ── H0: Translation ──────────────────────────────────────────────────────
-    P0_pred_T = P0 + dg
+    P0_pred_T = P0 + dg_panel
     E_T = trimmed_chamfer(P0_pred_T, P1)
     result["E_translation"] = E_T
-    print(f"[TypeCheck] H0 (Translation): E={E_T:.5f}")
+    print(f"[TypeCheck] H0 (Translation): E={E_T:.5f}  "
+          f"dg={np.round(dg, 4)}  dg_panel={np.round(dg_panel, 4)}")
 
     # ── H1–H4: Rotation around each candidate edge axis ──────────────────────
-    candidate_axes = estimate_edge_axes(P0)
+    P0_axis_fit = spatial_filter_axis_cloud(prepare_edge_axis_cloud(P0))
+    candidate_axes = estimate_edge_axes(P0_axis_fit, filter_outliers=False)
     if not candidate_axes:
         print("[TypeCheck] No valid edge axes found — defaulting to Translation")
         result["motion_type"] = "Translation"
         result["confidence"] = 0.5
+        visualize_typecheck_open3d(P0, P1, P0_pred_T, candidate_axes, result,
+                                   P0_axis_fit=P0_axis_fit)
         return result
 
     best_E_rot    = float("inf")
     best_axis_rec = None
+    best_P0_pred_R = None
 
     for ax in candidate_axes:
         theta = compute_theta_from_gripper(g0, g1, ax["point"], ax["dir"])
@@ -476,6 +939,7 @@ def type_check(P0: np.ndarray, P1: np.ndarray,
 
         if E < best_E_rot:
             best_E_rot = E
+            best_P0_pred_R = P0_pred_R
             best_axis_rec = {
                 "side":       ax["side"],
                 "point":      ax["point"].copy(),
@@ -523,6 +987,12 @@ def type_check(P0: np.ndarray, P1: np.ndarray,
 
     print(f"[TypeCheck] Forced decision: {result['motion_type']} "
           f"(conf={result['confidence']:.3f}, E_T={E_T:.5f}, E_R={best_E_rot:.5f})")
+    if result["motion_type"] == "Rotation" and best_P0_pred_R is not None:
+        P0_transformed = best_P0_pred_R
+    else:
+        P0_transformed = P0_pred_T
+    visualize_typecheck_open3d(P0, P1, P0_transformed, candidate_axes, result,
+                               P0_axis_fit=P0_axis_fit)
     return result
 
 
@@ -709,13 +1179,17 @@ def draw_annotated_image(rgb_bgr: np.ndarray,
 
     for det in detections:
         idx = det.get("index", 0)
-        color = PALETTE[int(idx) % len(PALETTE)]
+        is_cache = bool(det.get("is_cache", False))
+        color = (0, 215, 255) if is_cache else PALETTE[int(idx) % len(PALETTE)]
 
         x1, y1, x2, y2 = [int(v) for v in det["box"]]
         label = det["detection"][0]["label"]
         score = det["detection"][0]["score"]
 
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 3 if is_cache else 2)
+        if is_cache:
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            cv2.drawMarker(out, (cx, cy), color, cv2.MARKER_CROSS, 18, 2)
 
         id_text = f"{idx}"
         (tw, th), _ = cv2.getTextSize(id_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
@@ -731,7 +1205,7 @@ def draw_annotated_image(rgb_bgr: np.ndarray,
         margin = 10
         item_h = 24
         header_h = 25
-        leg_w  = 200
+        leg_w  = 360 if any(item["id"] >= CACHE_DET_INDEX_OFFSET for item in legend_items) else 200
         leg_h  = header_h + len(legend_items) * item_h + margin
 
         leg_x1 = W - leg_w - margin
@@ -751,6 +1225,91 @@ def draw_annotated_image(rgb_bgr: np.ndarray,
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
 
     return out
+
+
+def build_cache_detections(cache_entries: List[Dict[str, Any]],
+                           cam_pos: np.ndarray,
+                           cam_mat: np.ndarray,
+                           fovy: float,
+                           H: int,
+                           W: int) -> List[Dict[str, Any]]:
+    """Project cached handle positions into the current image as virtual detections."""
+    cache_dets: List[Dict[str, Any]] = []
+    for i, entry in enumerate(cache_entries):
+        handle_pos = CacheManager._effective_handle_pos(entry)
+        projected = project_world_to_pixel(handle_pos, cam_pos, cam_mat, fovy, H, W)
+        if projected is None:
+            continue
+
+        u, v, _ = projected
+        if not (-CACHE_MARKER_HALF_SIZE <= u < W + CACHE_MARKER_HALF_SIZE
+                and -CACHE_MARKER_HALF_SIZE <= v < H + CACHE_MARKER_HALF_SIZE):
+            continue
+
+        x1 = int(np.clip(u - CACHE_MARKER_HALF_SIZE, 0, W - 1))
+        y1 = int(np.clip(v - CACHE_MARKER_HALF_SIZE, 0, H - 1))
+        x2 = int(np.clip(u + CACHE_MARKER_HALF_SIZE, 0, W - 1))
+        y2 = int(np.clip(v + CACHE_MARKER_HALF_SIZE, 0, H - 1))
+        current_open = float(entry.get("current_open", 0.0))
+        motion_type = entry.get("motion_type", "Unknown")
+        if motion_type == "Rotation":
+            open_desc = f"{np.rad2deg(current_open):.0f}deg"
+        else:
+            open_desc = f"{current_open:.2f}m"
+
+        cache_dets.append({
+            "index": CACHE_DET_INDEX_OFFSET + i,
+            "box": [x1, y1, x2, y2],
+            "detection": [{
+                "label": f"cached_{motion_type}_handle_open_{open_desc}",
+                "score": 1.0,
+            }],
+            "is_cache": True,
+            "cache_entry": entry,
+            "cache_handle_pos": handle_pos.tolist(),
+        })
+
+    return cache_dets
+
+
+def format_detection_summary(detections: List[Dict[str, Any]]) -> str:
+    """Compact text summary sent alongside the annotated image."""
+    lines = []
+    for det in detections:
+        idx = det.get("index")
+        label = det["detection"][0].get("label", "handle")
+        box = [int(v) for v in det.get("box", [])]
+        if det.get("is_cache"):
+            entry = det["cache_entry"]
+            lines.append(
+                f"- ID {idx}: CACHE target, {entry.get('motion_type')} motion, "
+                f"current_open={float(entry.get('current_open', 0.0)):.3f}, box={box}"
+            )
+        else:
+            score = float(det["detection"][0].get("score", 0.0))
+            lines.append(f"- ID {idx}: detected {label}, score={score:.2f}, box={box}")
+    return "\n".join(lines)
+
+
+def is_reset_only_instruction(user_instruction: str) -> bool:
+    """Heuristic for reset-only commands that need no detection or VLM call."""
+    text = user_instruction.strip().lower()
+    reset_phrases = (
+        "reset",
+        "go back",
+        "back to start",
+        "start pose",
+        "initial pose",
+        "home pose",
+        "回到初始",
+        "回到启动",
+        "回到起始",
+        "复位",
+    )
+    manipulation_words = ("open", "close", "pull", "push", "打开", "关闭", "拉", "推")
+    return any(p in text for p in reset_phrases) and not any(
+        w in text for w in manipulation_words
+    )
 
 # ─────────────────────────── Visualization ────────────────────────────────────
 
@@ -839,26 +1398,53 @@ VLM_SYSTEM_PROMPT = """\
 **Task**:
 Analyze the input image containing ID-labeled bounding boxes of handles.
 Based on the user's natural language instruction, select the correct handle and
-determine the motion type.
+output a sequence of stages that accomplishes the instruction.
 
-**Motion Type Logic**:
-- `Translation`: The object slides (drawer). Action = `Pull_Linear`.
-- `Rotation`: The object swings on a hinge (cabinet door). Action = `Pull_Arc`.
+**Stage vocabulary**:
+- `MoveTo`        — Move to a pre-grasp / pre-push standoff in front of the panel.
+- `Grasp`         — Close gripper on the handle (open intents only).
+- `Pull_Linear`   — Open a drawer (slide outward). Requires grasp.
+- `Pull_Arc`      — Open a hinged door (swing outward). Requires grasp.
+- `Push_Linear`   — Close a drawer (slide inward). No grasp.
+- `Push_Arc`      — Close a hinged door (swing inward). No grasp.
+- `Release`       — Open gripper after pulling.
+- `Reset`         — Move the end effector back to the pose recorded when this action server started.
+
+(`Approach`, `ProbePull`, `TypeCheck` are auto-inserted by the server — do NOT
+include them.)
+
+**Action selection**:
+- "open <drawer>"      → ["MoveTo", "Grasp", "Pull_Linear", "Release"]
+- "open <door>"        → ["MoveTo", "Grasp", "Pull_Arc",    "Release"]
+- "close <drawer>"     → ["MoveTo", "Push_Linear"]
+- "close <door>"       → ["MoveTo", "Push_Arc"]
+- "open <X> then close it" (drawer) →
+    ["MoveTo", "Grasp", "Pull_Linear", "Release", "Push_Linear"]
+- "open <X> then close it" (door)   →
+    ["MoveTo", "Grasp", "Pull_Arc",    "Release", "Push_Arc"]
+- "reset" or "go back to start pose" → ["Reset"]
+
+Use visual cues to choose Linear vs Arc (drawer slides → Linear, hinged door
+swings → Arc). The server will refine or correct the motion type via
+TypeCheck or cache when needed.
 
 **Gripper Orientation Logic**:
-- `Vertical`: Select if the handle's width is significantly greater than its height.
-- `Horizontal`: Select if the handle's height >= width, or if it is a knob/square shape.
+- `Vertical`:   handle width significantly greater than its height.
+- `Horizontal`: handle height >= width, or knob / square shape.
 
 **Strict Constraints**:
-1. **Valid Stages**: ONLY use these: ["MoveTo", "Grasp", "Pull_Linear", "Pull_Arc", "Release"]
-   (The server will auto-insert Approach, ProbePull, TypeCheck — do NOT include them.)
-2. **Output Format**: Return ONLY a valid JSON object. No preamble, no post-analysis.
-3. Do NOT include `parent_object_id` — it is not needed.
+1. Use ONLY these stages: ["MoveTo", "Grasp", "Pull_Linear", "Pull_Arc",
+   "Push_Linear", "Push_Arc", "Release", "Reset"].
+2. Return ONLY a valid JSON object. No preamble, no post-analysis.
+3. Do NOT include `parent_object_id`.
+4. `target_handle_id` must be one of the integer IDs shown in the image/target list.
+   IDs >= 1000 are cached handles projected from memory. For close instructions,
+   prefer a matching CACHE target if the current visible handle is missing or ambiguous.
+   Exception: for a reset-only plan ["Reset"], use `target_handle_id`: -1.
 
 **JSON Schema**:
 {
   "target_handle_id": int,
-  "motion_type": "Translation" | "Rotation",
   "gripper_orientation": "Horizontal" | "Vertical",
   "plan": ["Stage_1", "Stage_2", ...]
 }
@@ -894,7 +1480,11 @@ def call_vlm(annotated_bgr: np.ndarray, user_instruction: str,
             try:
                 client = OpenAI(api_key=api_key)
                 image_data_url = _image_bgr_to_data_url(annotated_bgr)
-                prompt = VLM_SYSTEM_PROMPT + user_instruction
+                target_summary = format_detection_summary(detections)
+                prompt = (
+                    VLM_SYSTEM_PROMPT + user_instruction
+                    + "\n\n**Target List**:\n" + target_summary
+                )
 
                 response = client.responses.create(
                     model=VLM_MODEL,
@@ -920,14 +1510,9 @@ def call_vlm(annotated_bgr: np.ndarray, user_instruction: str,
                 print(f"[VLM] API call failed: {e} — falling back to hardcoded plan.")
 
     print("[VLM] Using hardcoded default plan.")
-    # return {
-    #     'target_handle_id': 8, 'parent_object_id': 7,
-    #     'motion_type': 'Translation', 'gripper_orientation': 'Vertical',
-    #     'plan': ['MoveTo', 'Grasp', 'Pull_Linear', 'Release']
-    # }
     return {
         'target_handle_id': 1,
-        'motion_type': 'Rotation', 'gripper_orientation': 'Horizontal',
+        'gripper_orientation': 'Horizontal',
         'plan': ['MoveTo', 'Grasp', 'Pull_Arc', 'Release']
     }
 
@@ -958,9 +1543,11 @@ class LoFTREstimatorThread:
         self._thread.start()
 
     def push(self, frame_id: int, depth: np.ndarray, rgb_bgr: np.ndarray,
-             c2w: np.ndarray, ee_poses_dict: Dict[int, np.ndarray]) -> None:
+             c2w: np.ndarray, lp_dict: Dict[str, np.ndarray],
+             ee_poses_dict: Dict[int, np.ndarray]) -> None:
         try:
-            self._queue.put_nowait((frame_id, depth, rgb_bgr, c2w, ee_poses_dict))
+            self._queue.put_nowait((frame_id, depth, rgb_bgr, c2w,
+                                    lp_dict, ee_poses_dict))
         except queue.Full:
             pass  # drop frame when thread is still processing the previous one
 
@@ -982,11 +1569,11 @@ class LoFTREstimatorThread:
             item = self._queue.get()
             if item is None:
                 break
-            frame_id, depth, rgb_bgr, c2w, ee_poses_dict = item
+            frame_id, depth, rgb_bgr, c2w, lp_dict, ee_poses_dict = item
             try:
                 result = self._estimator.step(
                     frame_id, depth, rgb_bgr, c2w,
-                    lp_dict={}, ee_poses_dict=ee_poses_dict
+                    lp_dict=lp_dict, ee_poses_dict=ee_poses_dict
                 )
                 if result is not None:
                     pivot, n_dir, theta, sigma_p, sigma_t = result
@@ -1038,6 +1625,10 @@ class ActionPlanner:
         self.use_visualizer = use_visualizer
         self.use_api = use_api
         self.visualizer = Visualizer3D() if use_visualizer else None
+        self.cache_manager = CacheManager()
+        self.home_pos: Optional[np.ndarray] = None
+        self.home_quat: Optional[np.ndarray] = None
+        self.home_grip: Optional[float] = None
         self._reset()
 
     # ── public ──────────────────────────────────────────────────────────────
@@ -1070,12 +1661,20 @@ class ActionPlanner:
         fovy     = float(deser(obs['fovy'])[0])
         ap       = deser(obs['agent_pos'])    # (1,T,10)
         pc       = deser(obs['point_cloud'])  # (1,T,N,3)
+        link_poses = (deser(obs['link_poses'])
+                      if 'link_poses' in obs else None)
 
         agent_last  = ap[0, -1, :]            # (10,)
         curr_pos    = agent_last[:3].copy()
         curr_rot    = rot6d_to_matrix(agent_last[3:9])
         curr_grip   = float(agent_last[9])
         pcloud_last = pc[0, -1, :, :]         # (1280,3)
+
+        if self.home_pos is None:
+            self.home_pos = curr_pos.copy()
+            self.home_quat = scipy_to_wxyz(R.from_matrix(curr_rot))
+            self.home_grip = curr_grip
+            print(f"[Planner] Home pose recorded at {np.round(self.home_pos, 3)}")
 
         rgb_bgr = cv2.cvtColor(rgb_arr, cv2.COLOR_RGB2BGR)
 
@@ -1085,6 +1684,7 @@ class ActionPlanner:
         self._curr_cam_pos = cam_pos
         self._curr_cam_mat = cam_mat
         self._curr_fovy    = fovy
+        self._curr_link_poses = link_pose_array_to_dict(link_poses)
 
         # Track EE history for LoFTR PF (frame_id → world position)
         self._frame_id += 1
@@ -1113,7 +1713,7 @@ class ActionPlanner:
             c2w[:3, 3]  = cam_pos.astype(np.float32)
             self._loftr_thread.push(
                 self._frame_id, depth.copy(), rgb_bgr.copy(),
-                c2w, self._ee_history.copy()
+                c2w, self._curr_link_poses.copy(), self._ee_history.copy()
             )
             if self.arc_initialized and self.arc_axis_point is not None:
                 new_pivot, new_dir = self._loftr_thread.get_axis()
@@ -1157,6 +1757,17 @@ class ActionPlanner:
         # Pull_Linear state
         self.pull_target : Optional[np.ndarray] = None
 
+        # Push state (Push_Linear / Push_Arc)
+        self.push_target    : Optional[np.ndarray] = None
+        self.push_final_pos : Optional[np.ndarray] = None
+        self.push_stall_ref_pos  : Optional[np.ndarray] = None
+        self.push_stall_since    : Optional[float] = None
+        self.push_stall_reported : bool = False
+
+        # Cache integration
+        self.cache_entry : Optional[Dict[str, Any]] = None
+        self.cache_hit   : bool = False
+
         # Legacy arc state (kept for fallback / visualizer)
         self.arc_hinge        : Optional[np.ndarray] = None
         self.arc_radius       : float = 0.3
@@ -1174,17 +1785,20 @@ class ActionPlanner:
         self.arc_axis_point   : Optional[np.ndarray] = None  # point on axis
         self.arc_axis_dir     : Optional[np.ndarray] = None  # unit direction
         self.arc_probe_theta  : float = 0.0                  # angle from probe
+        self.arc_open_sign    : float = 1.0                  # sign of opening rotation (used by Push_Arc)
 
         # Probe observations (saved at Grasp completion and ProbePull completion)
         self.probe_start_depth        : Optional[np.ndarray]         = None
         self.probe_start_rgb          : Optional[np.ndarray]         = None
         self.probe_start_cam_pose     : Optional[Tuple]              = None
+        self.probe_start_link_poses   : Dict[str, np.ndarray]        = {}
         self.probe_start_gripper_pos  : Optional[np.ndarray]         = None
         self.probe_start_object_pcd   : Optional[np.ndarray]         = None
 
         self.probe_end_depth          : Optional[np.ndarray]         = None
         self.probe_end_rgb            : Optional[np.ndarray]         = None
         self.probe_end_cam_pose       : Optional[Tuple]              = None
+        self.probe_end_link_poses     : Dict[str, np.ndarray]        = {}
         self.probe_end_gripper_pos    : Optional[np.ndarray]         = None
         self.probe_end_object_pcd     : Optional[np.ndarray]         = None
 
@@ -1202,18 +1816,41 @@ class ActionPlanner:
         self._curr_cam_pos : Optional[np.ndarray] = None
         self._curr_cam_mat : Optional[np.ndarray] = None
         self._curr_fovy    : float                 = 60.0
+        self._curr_link_poses : Dict[str, np.ndarray] = {}
 
     def _initialize(self, rgb_bgr, depth, cam_pos, cam_mat, fovy,
                     curr_pos, point_cloud):
         H, W = depth.shape
 
+        if is_reset_only_instruction(self.user_instruction):
+            self.plan_data = {
+                "target_handle_id": -1,
+                "gripper_orientation": "Horizontal",
+                "plan": ["Reset"],
+                "motion_type": "Reset",
+            }
+            self.stages = ["Reset"]
+            self.state = "EXECUTING"
+            self.stage_idx = 0
+            print("[Planner] Reset-only instruction — returning to recorded home pose.")
+            return
+
         # ── 1. Detection ───────────────────────────────────────────────────
         print("[Planner] [Step 1/7] Running detection...")
-        self.detections = call_detection(rgb_bgr)
-        print(f"[Planner] [Step 1/7] {len(self.detections)} objects detected.")
+        raw_detections = call_detection(rgb_bgr)
+        print(f"[Planner] [Step 1/7] {len(raw_detections)} objects detected.")
+
+        cache_detections = build_cache_detections(
+            self.cache_manager.entries, cam_pos, cam_mat, fovy, H, W
+        )
+        if cache_detections:
+            ids = [d["index"] for d in cache_detections]
+            print(f"[Planner] [Step 1/7] Rendered {len(cache_detections)} cache targets: {ids}")
+
+        self.detections = raw_detections + cache_detections
 
         if not self.detections:
-            print("[Planner] [Step 1/7] No detections — entering ERROR state.")
+            print("[Planner] [Step 1/7] No detections/cache targets — entering ERROR state.")
             self.state = "ERROR"
             return
 
@@ -1225,24 +1862,26 @@ class ActionPlanner:
         print("[Planner] [Step 3/7] Calling VLM reasoning...")
         plan = call_vlm(annotated, self.user_instruction, self.detections,
                         use_api=self.use_api)
+        if "motion_type" not in plan:
+            plan["motion_type"] = "Translation"
+            for stg in plan.get("plan", []):
+                if "Arc" in stg:
+                    plan["motion_type"] = "Rotation"
+                    break
         print(f"[Planner] [Step 3/7] VLM Plan resolved: {plan}")
         self.plan_data = plan
 
-        # Build stage list with auto-insertions
-        stages = list(plan["plan"])
-        # Auto-insert Approach between MoveTo and Grasp
-        if "MoveTo" in stages:
-            m_idx = stages.index("MoveTo")
-            if m_idx + 1 < len(stages) and stages[m_idx + 1] == "Grasp":
-                print("[Planner] Auto-inserting Approach stage...")
-                stages.insert(m_idx + 1, "Approach")
-        # Auto-insert ProbePull and TypeCheck after Grasp
-        if "Grasp" in stages:
-            g_idx = stages.index("Grasp")
-            stages.insert(g_idx + 1, "TypeCheck")
-            stages.insert(g_idx + 1, "ProbePull")
-            print("[Planner] Auto-inserting ProbePull and TypeCheck stages...")
-        self.stages = stages
+        # Defer stage list construction until after cache lookup (depends on
+        # whether ProbePull / TypeCheck are needed).
+        vlm_plan = list(plan["plan"])
+        if vlm_plan == ["Reset"]:
+            self.stages = ["Reset"]
+            self.state = "EXECUTING"
+            self.stage_idx = 0
+            print("[Planner] Reset-only plan — skipping handle geometry.")
+            return
+        has_pull = any("Pull" in s for s in vlm_plan)
+        has_push = any("Push" in s for s in vlm_plan)
 
         # ── 3. Resolve handle and parent detections ────────────────────────
         print("[Planner] [Step 4/7] Resolving 3D positions...")
@@ -1252,31 +1891,94 @@ class ActionPlanner:
         )
 
         # ── 4. Handle 3-D position via depth back-projection ───────────────
-        bx1, by1, bx2, by2 = handle_det["box"]
-        uc, vc = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
-        d_val = self._sample_valid_depth(depth, vc, uc, H, W)
-
-        if d_val > 0:
-            self.handle_3d = backproject_pixel(uc, vc, d_val, cam_pos, cam_mat, fovy, H, W)
+        if handle_det.get("is_cache"):
+            self.cache_entry = handle_det["cache_entry"]
+            self.cache_hit = True
+            self.handle_3d = np.asarray(handle_det["cache_handle_pos"], dtype=np.float64)
+            print(f"[Planner] [Step 4/7] Selected projected cache target "
+                  f"ID {handle_det['index']}; handle_3d = {np.round(self.handle_3d, 3)}")
         else:
-            self.handle_3d = point_cloud.mean(axis=0)
+            bx1, by1, bx2, by2 = handle_det["box"]
+            uc, vc = (bx1 + bx2) / 2.0, (by1 + by2) / 2.0
+            d_val = self._sample_valid_depth(depth, vc, uc, H, W)
 
-        self.handle_3d[2] += TARGET_Z_OFFSET
-        print(f"[Planner] [Step 4/7] handle_3d = {np.round(self.handle_3d, 3)}")
+            if d_val > 0:
+                self.handle_3d = backproject_pixel(uc, vc, d_val, cam_pos, cam_mat, fovy, H, W)
+            else:
+                self.handle_3d = point_cloud.mean(axis=0)
+
+            self.handle_3d[2] += TARGET_Z_OFFSET
+            print(f"[Planner] [Step 4/7] handle_3d = {np.round(self.handle_3d, 3)}")
+
+            # ── 4.5 Cache lookup ───────────────────────────────────────────
+            self.cache_entry = self.cache_manager.find(self.handle_3d)
+            self.cache_hit   = self.cache_entry is not None
+
+        if self.cache_hit:
+            print(f"[Cache] HIT motion_type={self.cache_entry['motion_type']}, "
+                  f"current_open={float(self.cache_entry.get('current_open', 0.0)):.3f}")
+        else:
+            print("[Cache] MISS")
+
+        # Cache miss on close-only task → cannot infer motion params
+        if not self.cache_hit and has_push and not has_pull:
+            print("[Planner] [ERROR] Close requested but no cache for this handle. "
+                  "Open / estimate the object first.")
+            self.state = "ERROR"
+            return
 
         # ── 5. Panel normal ────────────────────────────────────────────────
-        # Detection only captures handles now (no parent/door mask available).
-        # Panel normal is estimated purely from depth around the handle.
-        print("[Planner] [Step 5/7] Estimating panel normal (handle-only, no parent mask)...")
-        parent_mask = None
-        self.parent_mask = None
+        if self.cache_hit:
+            self.panel_normal = np.asarray(self.cache_entry["panel_normal"],
+                                           dtype=np.float64)
+            self.normal_pts   = np.zeros((0, 3))
+            print(f"[Planner] [Step 5/7] Panel normal from cache = "
+                  f"{np.round(self.panel_normal, 3)}")
+        else:
+            print("[Planner] [Step 5/7] Estimating panel normal (handle-only, no parent mask)...")
+            self.parent_mask = None
+            self.panel_normal, self.normal_pts = estimate_panel_normal(
+                depth, handle_det["box"], self.handle_3d,
+                cam_pos, cam_mat, fovy,
+                parent_mask=None
+            )
+            print(f"[Planner] Final normal = {np.round(self.panel_normal, 3)}")
 
-        self.panel_normal, self.normal_pts = estimate_panel_normal(
-            depth, handle_det["box"], self.handle_3d,
-            cam_pos, cam_mat, fovy,
-            parent_mask=None
-        )
-        print(f"[Planner] Final normal = {np.round(self.panel_normal, 3)}")
+        # ── 5.5 Build stage list (cache-aware) ─────────────────────────────
+        if self.cache_hit:
+            cached_motion_type = self.cache_entry["motion_type"]
+            # Override Linear / Arc choice using cache
+            stages = []
+            for s in vlm_plan:
+                if s in ("Pull_Linear", "Pull_Arc"):
+                    stages.append("Pull_Linear" if cached_motion_type == "Translation"
+                                  else "Pull_Arc")
+                elif s in ("Push_Linear", "Push_Arc"):
+                    stages.append("Push_Linear" if cached_motion_type == "Translation"
+                                  else "Push_Arc")
+                else:
+                    stages.append(s)
+            # Approach is needed only before Grasp; no ProbePull / TypeCheck
+            if "MoveTo" in stages:
+                m_idx = stages.index("MoveTo")
+                if m_idx + 1 < len(stages) and stages[m_idx + 1] == "Grasp":
+                    stages.insert(m_idx + 1, "Approach")
+            print(f"[Planner] Cache-driven stages: {stages}")
+        else:
+            stages = list(vlm_plan)
+            # Auto-insert Approach between MoveTo and Grasp
+            if "MoveTo" in stages:
+                m_idx = stages.index("MoveTo")
+                if m_idx + 1 < len(stages) and stages[m_idx + 1] == "Grasp":
+                    print("[Planner] Auto-inserting Approach stage...")
+                    stages.insert(m_idx + 1, "Approach")
+            # Auto-insert ProbePull and TypeCheck after Grasp (cache miss only)
+            if "Grasp" in stages:
+                g_idx = stages.index("Grasp")
+                stages.insert(g_idx + 1, "TypeCheck")
+                stages.insert(g_idx + 1, "ProbePull")
+                print("[Planner] Auto-inserting ProbePull and TypeCheck stages...")
+        self.stages = stages
 
         # ── 6. Approach orientation ────────────────────────────────────────
         print("[Planner] [Step 6/7] Planning approach trajectories...")
@@ -1285,15 +1987,44 @@ class ActionPlanner:
                    if plan.get("gripper_orientation") == "Horizontal"
                    else np.array([0.0, 0.0, 1.0]))
         approach_rot = look_at_rotation(approach_dir, up_hint)
-        self.approach_quat    = scipy_to_wxyz(R.from_matrix(approach_rot))
+        if self.cache_hit and self.cache_entry.get("approach_quat") is not None:
+            # Prefer the cached orientation so Push reuses the same wrist pose
+            # that originally generated the cache.
+            self.approach_quat = np.asarray(self.cache_entry["approach_quat"],
+                                            dtype=np.float64)
+        else:
+            self.approach_quat = scipy_to_wxyz(R.from_matrix(approach_rot))
         self.grasp_target_pos = self.handle_3d - GRASP_OFFSET * approach_dir
         self.approach_pos     = self.grasp_target_pos + self.panel_normal * APPROACH_DIST
 
-        # ── 7. Arc fallback default (hinge from parent mask removed) ──────
-        if plan["motion_type"] == "Rotation":
-            # No parent mask available — hinge will be determined by TypeCheck
-            # and refined online by LoFTR-FG.  Set a zero-placeholder here;
-            # _on_complete("TypeCheck") will overwrite it.
+        # ── 7. Arc setup ──────────────────────────────────────────────────
+        if self.cache_hit and self.cache_entry["motion_type"] == "Rotation":
+            missing = [
+                k for k in ("screw_axis_point", "screw_axis_dir")
+                if k not in self.cache_entry
+            ]
+            if missing:
+                print(f"[Planner] [ERROR] Rotation cache is missing {missing}. "
+                      "Please re-open / re-estimate this object to rebuild cache.")
+                self.state = "ERROR"
+                return
+            # Pre-populate arc axis from cache: skip TypeCheck / LoFTR refinement.
+            self.arc_axis_point  = np.asarray(self.cache_entry["screw_axis_point"],
+                                              dtype=np.float64)
+            self.arc_axis_dir    = np.asarray(self.cache_entry["screw_axis_dir"],
+                                              dtype=np.float64)
+            self.arc_probe_theta = 0.0
+            self.arc_direction   = 1.0  # signed axis already encodes opening direction
+            self.arc_hinge       = self.arc_axis_point.copy()
+            print(f"[Planner] [Step 7/7] Rotation cache loaded: axis_point="
+                  f"{np.round(self.arc_axis_point, 3)}, axis_dir="
+                  f"{np.round(self.arc_axis_dir, 3)}")
+        elif self.cache_hit and self.cache_entry["motion_type"] == "Translation":
+            self.arc_axis_point = None
+            self.arc_axis_dir   = None
+            print("[Planner] [Step 7/7] Translation cache loaded.")
+        elif plan["motion_type"] == "Rotation":
+            # Cache miss + Rotation: hinge determined by TypeCheck / LoFTR-FG.
             print("[Planner] [Step 7/7] Rotation plan detected. "
                   "Hinge will be set by TypeCheck / LoFTR-FG (no mask-based estimation).")
             self.arc_hinge  = np.zeros(3, dtype=np.float64)
@@ -1411,6 +2142,13 @@ class ActionPlanner:
     def _target(self, stage: str, curr_pos, curr_rot,
                 curr_grip) -> Tuple[np.ndarray, np.ndarray, float]:
         """Return (target_pos, target_quat_wxyz, target_gripper_width)."""
+
+        # ── Reset ─────────────────────────────────────────────────────────
+        if stage == "Reset":
+            q = self.home_quat if self.home_quat is not None else scipy_to_wxyz(R.from_matrix(curr_rot))
+            grip = self.home_grip if self.home_grip is not None else curr_grip
+            pos = self.home_pos if self.home_pos is not None else curr_pos
+            return np.asarray(pos, dtype=np.float64), np.asarray(q, dtype=np.float64), float(grip)
 
         # ── MoveTo ────────────────────────────────────────────────────────
         if stage == "MoveTo":
@@ -1544,6 +2282,123 @@ class ActionPlanner:
 
             return arc_pos, arc_quat, GRIPPER_CLOSED
 
+        # ── Push_Linear ───────────────────────────────────────────────────
+        elif stage == "Push_Linear":
+            if self.cache_entry is None:
+                # Should not happen — _initialize should have errored.
+                q = self.approach_quat
+                return curr_pos.copy(), q, GRIPPER_OPEN
+
+            cache = self.cache_entry
+            current_open = float(cache.get("current_open", 0.0))
+
+            if abs(current_open) < 1e-4 and self.push_final_pos is None:
+                # Already closed — nothing to do.
+                q = np.asarray(cache.get("approach_quat", self.approach_quat),
+                                dtype=np.float64)
+                return curr_pos.copy(), q, GRIPPER_OPEN
+
+            if self.push_final_pos is None:
+                panel_normal = np.asarray(cache["panel_normal"], dtype=np.float64)
+                closed_handle = np.asarray(cache["handle_pos"], dtype=np.float64)
+                # End-effector at closed-state handle, hand frame offset along
+                # panel_normal (mirror of Grasp's grasp_target_pos geometry).
+                self.push_final_pos = closed_handle + GRASP_OFFSET * panel_normal
+                self.push_target    = curr_pos.copy()
+                print(f"[Planner] Push_Linear init: target="
+                      f"{np.round(self.push_final_pos, 3)}, "
+                      f"current_open={current_open:.3f}m")
+
+            remaining = self.push_final_pos - self.push_target
+            d = float(np.linalg.norm(remaining))
+            if d > PUSH_STEP:
+                self.push_target = self.push_target + remaining / d * PUSH_STEP
+            else:
+                self.push_target = self.push_final_pos.copy()
+
+            q = np.asarray(cache.get("approach_quat", self.approach_quat),
+                            dtype=np.float64)
+            return self.push_target, q, GRIPPER_OPEN
+
+        # ── Push_Arc ──────────────────────────────────────────────────────
+        elif stage == "Push_Arc":
+            if self.cache_entry is None:
+                q = self.approach_quat
+                return curr_pos.copy(), q, GRIPPER_OPEN
+
+            cache = self.cache_entry
+            current_open = float(cache.get("current_open", 0.0))
+
+            if abs(current_open) < 1e-4 and not self.arc_initialized:
+                q = np.asarray(cache.get("approach_quat", self.approach_quat),
+                                dtype=np.float64)
+                return curr_pos.copy(), q, GRIPPER_OPEN
+
+            missing = [
+                k for k in ("screw_axis_point", "screw_axis_dir",
+                            "panel_normal", "handle_pos")
+                if k not in cache
+            ]
+            if missing:
+                print(f"[Planner] [ERROR] Push_Arc cache is missing {missing}; "
+                      "holding position. Re-open this object to rebuild the cache.")
+                self.state = "ERROR"
+                q = np.asarray(cache.get("approach_quat", self.approach_quat),
+                                dtype=np.float64)
+                return curr_pos.copy(), q, GRIPPER_OPEN
+
+            axis_point      = np.asarray(cache["screw_axis_point"], dtype=np.float64)
+            axis_dir        = np.asarray(cache["screw_axis_dir"],   dtype=np.float64)
+            panel_normal    = np.asarray(cache["panel_normal"],     dtype=np.float64)
+            closed_handle   = np.asarray(cache["handle_pos"],       dtype=np.float64)
+            cached_app_quat = np.asarray(cache.get("approach_quat", self.approach_quat),
+                                          dtype=np.float64)
+
+            if not self.arc_initialized:
+                # Reference = closed-state EE pose
+                self.arc_ref_pos  = closed_handle + GRASP_OFFSET * panel_normal
+                self.arc_ref_quat = cached_app_quat.copy()
+
+                v       = self.arc_ref_pos - axis_point
+                v_perp  = v - np.dot(v, axis_dir) * axis_dir
+                r_perp  = float(np.linalg.norm(v_perp))
+                if r_perp > 1e-4:
+                    self.arc_radius = r_perp
+
+                self.arc_init_theta  = abs(current_open)        # magnitude of start angle
+                self.arc_open_sign   = float(np.sign(current_open)) \
+                                       if abs(current_open) > 1e-6 else 1.0
+                self.arc_accumulated = 0.0
+                self.arc_swept       = 0.0
+                self.arc_initialized = True
+                print(f"[Planner] Push_Arc init: current_open="
+                      f"{np.rad2deg(current_open):.1f}°, radius={self.arc_radius:.3f}m")
+
+            self.arc_accumulated += PUSH_ANG_STEP
+            self.arc_swept        = self.arc_accumulated
+
+            # Decrement from |current_open| toward 0
+            remaining_mag = self.arc_init_theta - self.arc_accumulated
+            if remaining_mag < 0:
+                remaining_mag = 0.0
+            target_theta = self.arc_open_sign * remaining_mag
+
+            v_ref    = self.arc_ref_pos - axis_point
+            ref_perp = v_ref - np.dot(v_ref, axis_dir) * axis_dir
+            n_ref    = float(np.linalg.norm(ref_perp))
+            ref_dir  = ref_perp / n_ref if n_ref > 1e-4 else np.array([1., 0., 0.])
+
+            target_dir = R.from_rotvec(axis_dir * target_theta).apply(ref_dir)
+            along_ref  = float(np.dot(v_ref, axis_dir))
+            arc_pos    = (axis_point + along_ref * axis_dir
+                          + self.arc_radius * target_dir)
+
+            r_ref    = wxyz_to_scipy(self.arc_ref_quat)
+            r_offset = R.from_rotvec(axis_dir * target_theta)
+            arc_quat = scipy_to_wxyz(r_offset * r_ref)
+
+            return arc_pos, arc_quat, GRIPPER_OPEN
+
         # ── Release ───────────────────────────────────────────────────────
         elif stage == "Release":
             stay = (self.post_pull_pos if self.post_pull_pos is not None
@@ -1561,7 +2416,7 @@ class ActionPlanner:
     def _is_stage_done(self, stage: str,
                         pos_err: float, ang_err: float, grip_err: float,
                         curr_pos: np.ndarray) -> bool:
-        if stage in ("MoveTo", "Approach"):
+        if stage in ("MoveTo", "Approach", "Reset"):
             return (pos_err < APPROACH_POS_TOL) and (ang_err < STAGE_ANG_TOL)
 
         elif stage == "Grasp":
@@ -1586,10 +2441,140 @@ class ActionPlanner:
         elif stage == "Pull_Arc":
             return PULL_ARC_ANGLE - self.arc_swept < np.deg2rad(1.5)
 
+        elif stage == "Push_Linear":
+            if self.cache_entry is None:
+                return True
+            current_open = abs(float(self.cache_entry.get("current_open", 0.0)))
+            if current_open < 1e-4 and self.push_final_pos is None:
+                return True
+            if self.push_final_pos is None:
+                return False
+            return (np.linalg.norm(curr_pos - self.push_final_pos) < STAGE_POS_TOL
+                    or self._push_stalled(curr_pos))
+
+        elif stage == "Push_Arc":
+            if self.cache_entry is None:
+                return True
+            current_open = abs(float(self.cache_entry.get("current_open", 0.0)))
+            if current_open < 1e-4 and not self.arc_initialized:
+                return True
+            if not self.arc_initialized:
+                return False
+            return (self.arc_swept >= current_open - np.deg2rad(1.5)
+                    or self._push_stalled(curr_pos))
+
         elif stage == "Release":
             return (grip_err < STAGE_GRIP_TOL) or (self.stage_step_count > GRASP_TIMEOUT_STEPS)
 
         return False
+
+    def _push_stalled(self, curr_pos: np.ndarray) -> bool:
+        """Return True if the end effector has barely moved for long enough."""
+        now = time.monotonic()
+        if self.push_stall_ref_pos is None or self.push_stall_since is None:
+            self.push_stall_ref_pos = curr_pos.copy()
+            self.push_stall_since = now
+            self.push_stall_reported = False
+            return False
+
+        moved = float(np.linalg.norm(curr_pos - self.push_stall_ref_pos))
+        if moved > PUSH_STALL_POS_EPS:
+            self.push_stall_ref_pos = curr_pos.copy()
+            self.push_stall_since = now
+            self.push_stall_reported = False
+            return False
+
+        stalled_for = now - self.push_stall_since
+        if stalled_for >= PUSH_STALL_TIMEOUT:
+            if not self.push_stall_reported:
+                print(f"[Planner] Push stall timeout: EE moved < "
+                      f"{PUSH_STALL_POS_EPS * 1000:.1f}mm for "
+                      f"{stalled_for:.1f}s; treating push as complete.")
+                self.push_stall_reported = True
+            return True
+
+        return False
+
+    def _reset_arc_progress(self) -> None:
+        """Clear per-stage arc progress while keeping cached axis geometry."""
+        self.arc_initialized = False
+        self.arc_init_theta = 0.0
+        self.arc_accumulated = 0.0
+        self.arc_swept = 0.0
+        self.arc_open_sign = 1.0
+
+    def _save_translation_cache(self, opened: float) -> None:
+        """Insert or update the cache entry after Pull_Linear."""
+        if self.panel_normal is None:
+            print("[Cache] Translation save skipped — missing geometry.")
+            return
+
+        if self.cache_entry is not None:
+            handle_pos = np.asarray(
+                self.cache_entry.get("handle_pos",
+                                     self.handle_3d if self.handle_3d is not None else []),
+                dtype=np.float64,
+            )
+        elif self.handle_3d is not None:
+            handle_pos = self.handle_3d
+        else:
+            print("[Cache] Translation save skipped — missing handle position.")
+            return
+
+        slide_dir = self.panel_normal.copy()
+        approach_quat = (self.grasp_quat if self.grasp_quat is not None
+                         else self.approach_quat)
+        entry = {
+            "handle_pos":    np.asarray(handle_pos, dtype=np.float64).tolist(),
+            "motion_type":   "Translation",
+            "panel_normal":  self.panel_normal.tolist(),
+            "approach_quat": np.asarray(approach_quat, dtype=np.float64).tolist(),
+            "slide_dir":     slide_dir.tolist(),
+            "current_open":  float(opened),
+        }
+        self.cache_entry = self.cache_manager.upsert(entry)
+        self.cache_hit   = True
+        print(f"[Cache] Translation entry upserted: handle={np.round(handle_pos, 3)}, "
+              f"current_open={opened:.3f}m")
+
+    def _save_rotation_cache(self, opened: float) -> None:
+        """Insert or update the cache entry after Pull_Arc."""
+        if (self.panel_normal is None
+                or self.arc_axis_point is None or self.arc_axis_dir is None):
+            print("[Cache] Rotation save skipped — missing geometry / axis.")
+            return
+
+        if self.cache_entry is not None:
+            handle_pos = np.asarray(
+                self.cache_entry.get("handle_pos",
+                                     self.handle_3d if self.handle_3d is not None else []),
+                dtype=np.float64,
+            )
+        elif self.handle_3d is not None:
+            handle_pos = self.handle_3d
+        else:
+            print("[Cache] Rotation save skipped — missing handle position.")
+            return
+
+        # Signed axis direction: positive rotation around it = opening direction.
+        # During Pull_Arc, target_theta = arc_direction * accumulated angle, so the
+        # "opening" rotation is along arc_axis_dir * arc_direction.
+        signed_axis_dir = self.arc_axis_dir * float(self.arc_direction)
+        approach_quat = (self.grasp_quat if self.grasp_quat is not None
+                         else self.approach_quat)
+        entry = {
+            "handle_pos":       np.asarray(handle_pos, dtype=np.float64).tolist(),
+            "motion_type":      "Rotation",
+            "panel_normal":     self.panel_normal.tolist(),
+            "approach_quat":    np.asarray(approach_quat, dtype=np.float64).tolist(),
+            "screw_axis_point": self.arc_axis_point.tolist(),
+            "screw_axis_dir":   signed_axis_dir.tolist(),
+            "current_open":     float(opened),
+        }
+        self.cache_entry = self.cache_manager.upsert(entry)
+        self.cache_hit   = True
+        print(f"[Cache] Rotation entry upserted: handle={np.round(handle_pos, 3)}, "
+              f"current_open={np.rad2deg(opened):.1f}°")
 
     def _on_complete(self, stage: str, curr_pos: np.ndarray, curr_rot: np.ndarray):
         """Save state that later stages depend on."""
@@ -1605,6 +2590,9 @@ class ActionPlanner:
 
             # Save probe START observations (depth+pose only; PCD built after ProbePull)
             self.probe_start_gripper_pos = curr_pos.copy()
+            self.probe_start_link_poses = {
+                name: pos.copy() for name, pos in self._curr_link_poses.items()
+            }
             if self._curr_depth is not None:
                 self.probe_start_depth    = self._curr_depth.copy()
                 self.probe_start_rgb      = self._curr_rgb_bgr.copy()
@@ -1615,6 +2603,9 @@ class ActionPlanner:
         elif stage == "ProbePull":
             # Save probe END observations
             self.probe_end_gripper_pos = curr_pos.copy()
+            self.probe_end_link_poses = {
+                name: pos.copy() for name, pos in self._curr_link_poses.items()
+            }
             if self._curr_depth is not None:
                 self.probe_end_depth    = self._curr_depth.copy()
                 self.probe_end_rgb      = self._curr_rgb_bgr.copy()
@@ -1637,12 +2628,24 @@ class ActionPlanner:
                 if n_dyn >= 10:
                     pos0, mat0, fov0 = self.probe_start_cam_pose
                     pos1, mat1, fov1 = self.probe_end_cam_pose
-                    self.probe_start_object_pcd = backproject_mask_to_pcd(
+                    P0 = backproject_mask_to_pcd(
                         d0, dyn_mask, pos0, mat0, fov0
                     )
-                    self.probe_end_object_pcd = backproject_mask_to_pcd(
+                    P1 = backproject_mask_to_pcd(
                         d1, dyn_mask, pos1, mat1, fov1
                     )
+                    P0, P1, removed, before = filter_robot_points_pair(
+                        P0, P1,
+                        self.probe_start_link_poses,
+                        self.probe_end_link_poses,
+                    )
+                    if before > 0:
+                        print(f"[Planner] Robot PCD filter: removed "
+                              f"{removed}/{before} dynamic pts")
+                    else:
+                        print("[Planner] Robot PCD filter skipped: no link_poses in obs")
+                    self.probe_start_object_pcd = P0
+                    self.probe_end_object_pcd = P1
                     print(f"[Planner] Probe dynamic PCD: "
                           f"P0={len(self.probe_start_object_pcd)} pts, "
                           f"P1={len(self.probe_end_object_pcd)} pts")
@@ -1668,10 +2671,12 @@ class ActionPlanner:
             remaining = list(self.stages[self.stage_idx + 1:])
             new_remaining = []
             for s in remaining:
-                if motion_type == "Translation" and s == "Pull_Arc":
-                    new_remaining.append("Pull_Linear")
-                elif motion_type == "Rotation" and s == "Pull_Linear":
-                    new_remaining.append("Pull_Arc")
+                if s in ("Pull_Linear", "Pull_Arc"):
+                    new_remaining.append("Pull_Linear" if motion_type == "Translation"
+                                         else "Pull_Arc")
+                elif s in ("Push_Linear", "Push_Arc"):
+                    new_remaining.append("Push_Linear" if motion_type == "Translation"
+                                         else "Push_Arc")
                 else:
                     new_remaining.append(s)
             self.stages[self.stage_idx + 1:] = new_remaining
@@ -1726,6 +2731,25 @@ class ActionPlanner:
             if stage == "Pull_Arc" and self._loftr_thread is not None:
                 self._loftr_thread.stop()
                 self._loftr_thread = None
+            # Persist motion params to cache (insert on miss, update on hit)
+            if stage == "Pull_Linear":
+                self._save_translation_cache(opened=PULL_LINEAR_DIST)
+            else:
+                self._save_rotation_cache(opened=PULL_ARC_ANGLE)
+                self._reset_arc_progress()
+
+        elif stage in ("Push_Linear", "Push_Arc"):
+            self.post_pull_pos   = curr_pos.copy()
+            self.push_target     = None
+            self.push_final_pos  = None
+            self.push_stall_ref_pos = None
+            self.push_stall_since = None
+            self.push_stall_reported = False
+            self._reset_arc_progress()
+            if self.cache_entry is not None:
+                self.cache_manager.update_open(self.cache_entry, 0.0)
+                self.cache_entry["current_open"] = 0.0
+                print("[Planner] Cache updated: current_open=0 (closed)")
 
 # ─────────────────────────── ZMQ server main loop ─────────────────────────────
 
@@ -1742,10 +2766,17 @@ def main():
     socket.bind(f"tcp://*:{ZMQ_PORT}")
     print(f"[Server] VLM Action Server listening on tcp://*:{ZMQ_PORT}")
     print(f"[Server] Detection endpoint: {DET_SERVER_URL}")
-    print(f"[Server] User instruction: '{USER_INSTRUCTION}'")
     print(f"[Server] use_api={args.use_api}")
 
-    planner = ActionPlanner(user_instruction=USER_INSTRUCTION, use_api=args.use_api)
+    print("\n" + "=" * 60)
+    print("Welcome to Interactive VLM Action Server!")
+    print("=" * 60)
+    initial_instruction = input(f"[Server] Enter initial instruction (default: '{USER_INSTRUCTION}'): ").strip()
+    if not initial_instruction:
+        initial_instruction = USER_INSTRUCTION
+    print(f"[Server] Starting with instruction: '{initial_instruction}'\n" + "=" * 60)
+
+    planner = ActionPlanner(user_instruction=initial_instruction, use_api=args.use_api)
 
     poller = zmq.Poller()
     poller.register(socket, zmq.POLLIN)
@@ -1782,6 +2813,24 @@ def main():
                 'stage': planner.current_stage,
             }
             socket.send(zlib.compress(pickle.dumps(reply, protocol=pickle.HIGHEST_PROTOCOL)))
+
+            # Interactive task loop
+            if planner.state in ("DONE", "ERROR"):
+                print("\n" + "=" * 60)
+                print(f"[Server] Task execution finished. State: {planner.state}")
+                print("=" * 60)
+                next_inst = input("[Server] Enter next instruction (or 'q' to quit): ").strip()
+                if next_inst.lower() in ('q', 'quit', 'exit'):
+                    print("[Server] Exiting action server.")
+                    break
+                elif next_inst:
+                    planner.reset()
+                    planner.user_instruction = next_inst
+                    print(f"[Server] Reset planner with new instruction: '{next_inst}'\n" + "=" * 60)
+                else:
+                    planner.reset()
+                    planner.user_instruction = USER_INSTRUCTION
+                    print(f"[Server] Reset planner with default instruction: '{USER_INSTRUCTION}'\n" + "=" * 60)
         else:
             if planner.visualizer:
                 planner.visualizer.update()

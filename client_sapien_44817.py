@@ -19,6 +19,12 @@ except ImportError:
 import sapien
 import sapien.render
 
+ROBOT_LINK_NAMES = [
+    "panda_link0", "panda_link1", "panda_link2", "panda_link3", "panda_link4",
+    "panda_link5", "panda_link6", "panda_link7", "panda_link8",
+    "panda_hand", "panda_leftfinger", "panda_rightfinger",
+]
+
 # -----------------
 # 数学工具
 # -----------------
@@ -190,6 +196,16 @@ def get_agent_pos(hand_link, panda):
     g = float(np.mean(qpos[7:9]))
     res = np.concatenate([eef_pos, orient_6d, [g]])
     return res.astype(np.float32)[None, :]
+
+
+def get_robot_link_poses(panda):
+    """Return fixed-order Panda link positions for action_server robot filtering."""
+    pose_map = {link.name: link.entity.get_pose().p for link in panda.get_links()}
+    poses = np.full((len(ROBOT_LINK_NAMES), 3), np.nan, dtype=np.float32)
+    for i, name in enumerate(ROBOT_LINK_NAMES):
+        if name in pose_map:
+            poses[i] = np.asarray(pose_map[name], dtype=np.float32)
+    return poses
 
 # -----------------
 # 数值雅可比 IK
@@ -469,6 +485,7 @@ def main():
                 cur_pc = get_point_cloud_from_buffers(pos_buf, seg_buf, cam, cabinet_seg_ids)
                 cur_gp = get_gripper_pcd(hand_link, lf_link, rf_link)
                 cur_ap = get_agent_pos(hand_link, panda)
+                cur_lp = get_robot_link_poses(panda)
                 cur_rgb, cur_depth = get_raw_rgb_depth_from_buffers(pos_buf, col_buf)
                 cam_pos, cam_mat, fovy = get_camera_params(cam)
 
@@ -498,6 +515,7 @@ def main():
                 obs_msg = {
                     'point_cloud': batch_pc, 'gripper_pcd': batch_gp, 'agent_pos': batch_ap,
                     'rgb': cur_rgb, 'depth': cur_depth, 'cam_pos': cam_pos, 'cam_mat': cam_mat, 'fovy': np.array([fovy]),
+                    'link_poses': cur_lp,
                 }
                 comm_thread.obs_queue.put(obs_msg)
 

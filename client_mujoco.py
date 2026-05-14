@@ -14,6 +14,11 @@ import mujoco
 import mujoco.viewer
 import fpsample
 
+ROBOT_BODY_NAMES = [
+    "link0", "link1", "link2", "link3", "link4", "link5",
+    "link6", "link7", "link8", "hand", "left_finger", "right_finger",
+]
+
 def compute_ik(model, data_ik, body_id, target_pos, target_quat, max_iter=50, tol=1e-4, lr=0.5):
     jacp = np.zeros((3, model.nv))
     jacr = np.zeros((3, model.nv))
@@ -285,6 +290,16 @@ def get_gripper_pcd(model, data, eef_report_offset=0.0):
     gripper_pc = np.array([hand_pos, rf_pos, lf_pos, eef_pos])
     return gripper_pc.astype(np.float32)[None, :, :]
 
+
+def get_robot_link_poses(model, data):
+    """Return fixed-order Panda link positions for action_server robot filtering."""
+    poses = np.full((len(ROBOT_BODY_NAMES), 3), np.nan, dtype=np.float32)
+    for i, name in enumerate(ROBOT_BODY_NAMES):
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if body_id >= 0:
+            poses[i] = data.xpos[body_id].astype(np.float32)
+    return poses
+
 def get_raw_rgb_depth(renderer_rgb, renderer_depth, model, data):
     """
     Render raw RGB (H×W×3 uint8) and depth (H×W float32, metres) from
@@ -548,6 +563,7 @@ def main():
             cur_pc = get_point_cloud_from_mujoco(renderer_depth, model, data, cabinet_body_id)
             cur_gp = get_gripper_pcd(model, data, eef_report_offset=EEF_REPORT_OFFSET)
             cur_ap = get_agent_pos(model, data, eef_report_offset=EEF_REPORT_OFFSET)
+            cur_lp = get_robot_link_poses(model, data)
 
             # RGB + raw depth + camera params (needed by VLM action server)
             cur_rgb, cur_depth = get_raw_rgb_depth(renderer_rgb, renderer_depth, model, data)
@@ -586,7 +602,8 @@ def main():
             obs_dict = {
                 'point_cloud': batch_pc,
                 'gripper_pcd': batch_gp,
-                'agent_pos': batch_ap
+                'agent_pos': batch_ap,
+                'link_poses': cur_lp,
             }
 
             # 序列化处理以规避两端 NumPy 版本差异
