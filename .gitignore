@@ -21,3 +21,5 @@ recon_output/
 experiments/
 # Sidecar runtime annotated image (rewritten each /detect call)
 action_server_annotated.jpg
+# Action server per-call response caches (one JSON per /complete invocation)
+action_server_cache_*.json
