@@ -120,18 +120,25 @@ def _preload_sam3_on_main_thread():
         print(f"[recon][startup] SAM3 ready (device={sam3._device})", flush=True)
 
     # Install GT-mask shim. `_gt_masks` is a dict[frame_idx, dict[part_name, bool ndarray]].
-    # When all currently-buffered frames have a GT mask plant, the shim returns
-    # those directly without touching the GPU. When any frame lacks a plant
-    # (rare in our streaming use), it falls back to the original SAM3 method.
+    # F1c (Commit 3): per-(frame, part) override. Always run real SAM3 first
+    # to get a baseline mask for every (frame, part); then overlay GT entries
+    # from `_gt_masks` cell-by-cell. Trade-off vs the prior all-or-nothing shim:
+    # SAM3 always runs (no skip-on-full-plant fast path), but a single missing
+    # plant on one frame no longer poisons the whole window — the SAM3 baseline
+    # fills the gap, and other planted (frame, part) cells still take effect.
     sam3._gt_masks = {}                          # type: ignore[attr-defined]
     _real_compute = sam3.compute_masks_through_latest
 
     def _compute_with_gt_fallback():
         if not sam3.ready:
             return None
-        if all(fidx in sam3._gt_masks for fidx in sam3.frames):
-            return {fidx: dict(sam3._gt_masks[fidx]) for fidx in sorted(sam3.frames)}
-        return _real_compute()
+        result = _real_compute() or {}
+        for fidx, parts_gt in sam3._gt_masks.items():
+            if fidx not in result:
+                result[fidx] = {}
+            for p, m in parts_gt.items():
+                result[fidx][p] = m
+        return result
 
     sam3.compute_masks_through_latest = _compute_with_gt_fallback   # type: ignore[method-assign]
     print("[recon][startup] GT-mask shim installed on sam3.compute_masks_through_latest", flush=True)
