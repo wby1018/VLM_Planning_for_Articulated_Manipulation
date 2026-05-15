@@ -22,6 +22,8 @@ import tempfile
 import sapien
 import sapien.render
 
+from loftr_fg import get_dynamic_mask  # F1c: depth-diff dynamic mask (used in Commit 2+)
+
 # Reconstruction sidecar (Option 2 — Sidecar). Sends RGB-D frames to a
 # separate FastAPI server; does NOT affect ActionPlanner decisions.
 RECON_URL = "http://localhost:8002"
@@ -501,6 +503,8 @@ def main():
     panda.set_pose(sapien.Pose(p=[0.4, 0.30, 0.0]))
 
     panda_links = panda.get_links()
+    robot_seg_ids = set(l.entity.per_scene_id for l in panda_links)
+    print(f"[client][F1c-setup] robot_seg_ids ({len(robot_seg_ids)}): {sorted(robot_seg_ids)}", flush=True)
     hand_link = next(l for l in panda_links if l.name == 'panda_hand')
     lf_link   = next(l for l in panda_links if l.name == 'panda_leftfinger')
     rf_link   = next(l for l in panda_links if l.name == 'panda_rightfinger')
@@ -589,6 +593,9 @@ def main():
     recon_state_dir = None
     recon_frame_idx = 0
     last_recon_send_wall_time = 0.0  # seconds, w.r.t. start_wall_time
+    # F1c: previous recon-frame depth, carries across recon frames (NOT sim frames).
+    # Populated in Commit 2 inside the ingest block (after a successful POST).
+    prev_depth_for_dyn: np.ndarray | None = None
 
     # Sub-milestone 1a: track ActionPlanner stage transitions to sync sidecar's
     # moving-part assignment when Grasp completes.
